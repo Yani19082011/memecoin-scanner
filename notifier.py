@@ -10,6 +10,7 @@ App Passwords на Family Link (supervised) акаунти. Resend е безпл
 """
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -19,6 +20,22 @@ from scoring import MemeScoreResult
 log = logging.getLogger("notifier")
 
 RESEND_API_URL = "https://api.resend.com/emails"
+
+
+def _within_active_hours() -> bool:
+    """Проверява дали текущият момент е в разрешения прозорец за имейли
+    (config.ALERT_ACTIVE_START_* / ALERT_ACTIVE_END_* в ALERT_QUIET_HOURS_TZ).
+    Ако timezone данните липсват по някаква причина - НЕ блокираме (по-добре
+    да получиш имейл в грешен час, отколкото да мълчим заради bug)."""
+    try:
+        tz = ZoneInfo(config.ALERT_QUIET_HOURS_TZ)
+    except Exception as e:
+        log.warning("ALERT_QUIET_HOURS_TZ (%s) невалиден: %s - пропускам проверката за часове.", config.ALERT_QUIET_HOURS_TZ, e)
+        return True
+    now_local = datetime.now(tz)
+    start = now_local.replace(hour=config.ALERT_ACTIVE_START_HOUR, minute=config.ALERT_ACTIVE_START_MINUTE, second=0, microsecond=0)
+    end = now_local.replace(hour=config.ALERT_ACTIVE_END_HOUR, minute=config.ALERT_ACTIVE_END_MINUTE, second=0, microsecond=0)
+    return start <= now_local <= end
 
 # --- Anti-spam темпо-ограничител за Resend (виж config.MIN_EMAIL_INTERVAL_SECONDS /
 # MAX_EMAILS_PER_DAY) - пази в паметта на процеса, реду се при restart на Render,
@@ -89,6 +106,13 @@ def send_alert(result: MemeScoreResult):
 def _send_email(subject: str, body: str):
     if not (config.RESEND_API_KEY and config.ALERT_EMAIL_TO):
         log.warning("Email алъртите са включени, но RESEND_API_KEY/ALERT_EMAIL_TO не са попълнени.")
+        return
+    if not _within_active_hours():
+        log.info(
+            "Извън разрешените часове за имейли (%02d:%02d-%02d:%02d %s) - пропускам email-а (алъртът е в логовете).",
+            config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
+            config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ,
+        )
         return
     if not _rate_limit_ok():
         return

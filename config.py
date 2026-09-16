@@ -47,6 +47,18 @@ MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "300"))
 # (споделена с penny-stock-scanner) - там пращаме 10/ден, тук 90/ден.
 MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "90"))
 
+# --- "Тихи часове" за имейл алъртите - потребителят иска имейли САМО между
+# 07:30 и 23:00 местно време (не иска да го буди бот през нощта). За разлика
+# от penny-stock-scanner-а, memecoin ботът следи pump.fun 24/7 (crypto пазарът
+# никога не спира) - затова тук границата реално има значение, не е просто
+# резерва. Алъртите пак се логват в Render Logs денонощно - само самото
+# изпращане на email се пропуска извън тези часове. ---
+ALERT_QUIET_HOURS_TZ = os.getenv("ALERT_QUIET_HOURS_TZ", "Europe/Sofia")
+ALERT_ACTIVE_START_HOUR = int(os.getenv("ALERT_ACTIVE_START_HOUR", "7"))
+ALERT_ACTIVE_START_MINUTE = int(os.getenv("ALERT_ACTIVE_START_MINUTE", "30"))
+ALERT_ACTIVE_END_HOUR = int(os.getenv("ALERT_ACTIVE_END_HOUR", "23"))
+ALERT_ACTIVE_END_MINUTE = int(os.getenv("ALERT_ACTIVE_END_MINUTE", "0"))
+
 # --- Impersonation филтър ---
 # pump.fun монети, кръстени на известни хора/личности (Elon Musk, Trump и
 # т.н.) practически НИКОГА не са реално създадени от въпросния човек - това
