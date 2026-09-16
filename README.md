@@ -67,11 +67,13 @@ migration съобщенията / risk доклада — кодът в `data_s
 4. Environment таб → добави промените от `.env.example`, които искаш различни от defaults (най-важно: `ALERT_EMAIL_ENABLED`, `SMTP_USERNAME`, `SMTP_APP_PASSWORD`, `ALERT_EMAIL_TO`).
 5. **Keep-alive (за да не заспива безплатния Render план):** регистрирай се безплатно в [cron-job.org](https://cron-job.org) или [UptimeRobot](https://uptimerobot.com) и направи HTTP GET заявка към твоя Render URL (`https://<service>.onrender.com/`) на всеки 10 минути. Ако не го направиш, service-ът заспива след 15 мин без трафик и пропуска graduation събития дотогава.
 
-## 4. Email алърти
+## 4. Email алърти през Resend (не Gmail SMTP)
 
-Същите Gmail App Password стъпки като penny stock бота:
-1. Google Account → Security → включи 2-Step Verification → "App passwords" → генерирай.
-2. `ALERT_EMAIL_ENABLED=true`, `SMTP_USERNAME=твоя-имейл@gmail.com`, `SMTP_APP_PASSWORD=<app password>`, `ALERT_EMAIL_TO=yani.kolev2011@gmail.com`.
+Същите стъпки като penny stock бота — Gmail "App Passwords" не работят на
+Family Link (supervised) акаунти, затова ползваме [Resend](https://resend.com):
+1. Регистрация на resend.com (със същия имейл, на който искаш алъртите).
+2. Dashboard → API Keys → Create API Key → копирай.
+3. `ALERT_EMAIL_ENABLED=true`, `RESEND_API_KEY=<ключа>`, `RESEND_FROM_EMAIL=onboarding@resend.dev`, `ALERT_EMAIL_TO=yani.kolev2011@gmail.com` (трябва да съвпада с имейла, с който си регистриран в Resend).
 
 ## Структура
 
