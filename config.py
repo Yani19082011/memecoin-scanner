@@ -36,6 +36,62 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com")
 
+# --- Anti-spam защита за Resend дневната квота (безплатен tier = 100 имейла/ден
+# за целия акаунт, споделен с другите ботове, ползващи същия RESEND_API_KEY) ---
+# Не пращаме имейл по-често от веднъж на MIN_EMAIL_INTERVAL_SECONDS (300с = 5мин,
+# значи максимум ~2 имейла на всеки 10 минути), плюс твърд дневен таван като
+# резерва под истинския лимит на Resend. Алъртът винаги се вижда в Render Logs -
+# само самото email изпращане се прескача, ако сме над темпото.
+MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "300"))
+# Memecoin ботът получава по-голямата част от общата дневна квота от 100
+# (споделена с penny-stock-scanner) - там пращаме 10/ден, тук 90/ден.
+MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "90"))
+
+# --- Impersonation филтър ---
+# pump.fun монети, кръстени на известни хора/личности (Elon Musk, Trump и
+# т.н.) practически НИКОГА не са реално създадени от въпросния човек - това
+# е чест "hype" trick за rug pull. Понеже няма начин да потвърдим реална
+# автентичност през безплатни API-та, монета чието име/символ съвпада с
+# някое от тези ключови думи автоматично се пропуска (score=0), вместо да
+# разчитаме на моментум/ликвидност да я скрият случайно.
+IMPERSONATION_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.getenv(
+        "IMPERSONATION_KEYWORDS",
+        "elon,elonmusk,musk,spacex,neuralink,"
+        "trump,donaldtrump,maga,"
+        "biden,joebiden,kamala,kamalaharris,"
+        "obama,barackobama,putin,zelensky,zelenskyy,"
+        "kanye,yeezy,drake,kimkardashian,kardashian,"
+        "messi,ronaldo,neymar,"
+        "mrbeast,"
+        "bezos,jeffbezos,zuckerberg,markzuckerberg,gates,billgates,"
+        "buffett,warrenbuffett,cathiewood,sbf,sambankmanfried,"
+        "taylorswift,beyonce,rihanna,kimjongun,"
+        "vitalik,vitalikbuterin,buterin,satoshi,cz_binance,changpeng,zhao,"
+        "justinsun,tron",
+    ).split(",")
+    if kw.strip()
+]
+
+# Само име на известна личност в тикъра НЕ е достатъчно, за да пропуснем
+# монетата - "PAIDLON", "WIFELON", "$SUNGE" (Justin Sun Prize) са класически
+# pump.fun meme/joke имена, НЕ твърдят реална връзка, и реално потребителят
+# потвърди че такива монети са били добри (не instant rug, една дори +518%).
+# Затова блокираме само когато ИМЕТО НА ЛИЧНОСТ + ДУМА ЗА "легитимност/
+# официалност" се появят заедно - това е истинският сигнал за измама, която
+# твърди реална връзка с човека (напр. "Elon Musk Official", "Real Trump
+# Coin"), не обикновена meme препратка.
+IMPERSONATION_LEGITIMACY_WORDS = [
+    kw.strip().lower()
+    for kw in os.getenv(
+        "IMPERSONATION_LEGITIMACY_WORDS",
+        "official,verified,genuine,authentic,foundation,realaccount,"
+        "confirmed,endorsed,ceo",
+    ).split(",")
+    if kw.strip()
+]
+
 PORT = int(os.getenv("PORT", "10000"))
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")

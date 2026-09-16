@@ -2,6 +2,7 @@
 Композитен score 0-100 за graduated монета, само от публични данни
 (ликвидност, обем, риск флагове) - без "insider" информация.
 """
+import re
 from dataclasses import dataclass, field
 
 import config
@@ -79,22 +80,40 @@ def _momentum_points(momentum_pct: float) -> float:
     return 0
 
 
+def _normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def is_likely_impersonation(name: str, symbol: str) -> bool:
+    """Блокира САМО реални твърдения за автентичност (име на личност +
+    "official"/"verified"/... заедно), не обикновени meme препратки като
+    "Paid Elon" или "WIFELON" - такива са класически pump.fun joke имена,
+    не твърдят реална връзка, и потвърдено има добри резултати сред тях."""
+    combined = _normalize(name) + _normalize(symbol)
+    if not combined:
+        return False
+    has_celeb_name = any(kw in combined for kw in config.IMPERSONATION_KEYWORDS)
+    if not has_celeb_name:
+        return False
+    return any(word in combined for word in config.IMPERSONATION_LEGITIMACY_WORDS)
+
+
 def classify_potential(market_cap_usd: float, momentum_pct: float, volume_h1: float, liquidity_usd: float) -> str:
-    """Чисто спекулативна, евристична етикетировка - НЕ прогноза и НЕ
+    """Едно изречение, ВИНАГИ започващо с изричен "long runner: ДА/НЕ/НЕЯСНО"
+    отговор - чисто спекулативна, евристична преценка, НЕ прогноза и НЕ
     финансов съвет. "Short squeeze" не съществува тук физически (graduated
     pump.fun монети се търгуват само на обикновен AMM, няма borrow/маржин
-    механизъм за да се шортват - затова няма as смисъл такава категория).
-    Вместо това: груба преценка "колко рано сме" + "колко силен е моментума"."""
+    механизъм за да се шортват - затова няма смисъл такава категория)."""
     ratio = (volume_h1 / liquidity_usd) if liquidity_usd else 0
 
     if market_cap_usd and market_cap_usd < 50_000 and momentum_pct >= 30 and ratio >= 1:
-        return ("🚀 Потенциален голям runner (нисък market cap + силен ранен моментум + висок обем) - "
-                "но силно спекулативно, повечето такива монети пак отиват на 0")
+        return ("🚀 Long runner: ДА (спекулативно) - нисък market cap + силен ранен моментум + висок обем спрямо "
+                "ликвидност, но повечето такива монети пак отиват на 0")
     if momentum_pct >= 100:
-        return "⚠️ Вече силно изпомпана - влизаш късно, повишен риск точно сега да е dump, не продължение на pump-а"
+        return "⚠️ Long runner: НЕ - вече силно изпомпана, влизаш късно с повишен риск точно сега да е dump"
     if market_cap_usd and market_cap_usd < 100_000:
-        return "🌱 Все още малка по market cap - потенциал за растеж, но и стандартно висок rug риск за тази категория"
-    return "➖ Умерен/неясен потенциал по наличните данни"
+        return "🌱 Long runner: НЕЯСНО - все още малка по market cap с потенциал, но и стандартно висок rug риск"
+    return "➖ Long runner: НЕ - умерен/неясен потенциал по наличните данни"
 
 
 def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct: float = 0.0) -> MemeScoreResult:
@@ -103,6 +122,26 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
 
     liquidity_usd = (best_pair.get("liquidity") or {}).get("usd", 0) or 0
     market_cap_usd = best_pair.get("marketCap") or best_pair.get("fdv") or 0
+
+    base_token = best_pair.get("baseToken") or {}
+    token_name = base_token.get("name", "")
+    token_symbol = base_token.get("symbol", "")
+
+    # Impersonation филтър - виж config.IMPERSONATION_KEYWORDS. Проверяваме
+    # първо, преди всичко останало - няма смисъл да score-ваме монета, която
+    # най-вероятно е "hype" измама с чуждо име.
+    if is_likely_impersonation(token_name, token_symbol):
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[
+                f"'{token_name or token_symbol}' твърди реална връзка с публична личност (official/verified/...) - "
+                "пропускам, защото не можем безплатно да потвърдим автентичност (чест scam vector)"
+            ],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
 
     # Твърд минимален праг за ликвидност - НЕ просто точки от скоринга.
     # Без това, монета с $3 ликвидност може да "спечели" почти пълни точки за
