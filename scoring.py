@@ -22,6 +22,7 @@ class MemeScoreResult:
     score: float
     reasons: list = field(default_factory=list)
     liquidity_usd: float = 0.0
+    market_cap_usd: float = 0.0
     raw: dict = field(default_factory=dict)
 
     @property
@@ -81,10 +82,28 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
     if not best_pair:
         return MemeScoreResult(mint=mint, score=0, reasons=["няма DexScreener pair - вероятно още не е индексиран"])
 
+    liquidity_usd = (best_pair.get("liquidity") or {}).get("usd", 0) or 0
+    market_cap_usd = best_pair.get("marketCap") or best_pair.get("fdv") or 0
+
+    # Твърд минимален праг за ликвидност - НЕ просто точки от скоринга.
+    # Без това, монета с $3 ликвидност може да "спечели" почти пълни точки за
+    # обем (обем/ликвидност съотношението избухва при нищожен знаменател) и
+    # да мине прага само заради моментум - въпреки че реално няма никаква
+    # ликвидност, в която да влезеш/излезеш. Затова просто отхвърляме такива
+    # монети още тук, независимо от score-а на другите фактори.
+    if liquidity_usd < config.MIN_LIQUIDITY_USD:
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[f"ликвидност твърде ниска (${liquidity_usd:,.2f}) - под минимума ${config.MIN_LIQUIDITY_USD:,.0f}"],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
+
     reasons = []
     points = 0.0
 
-    liquidity_usd = (best_pair.get("liquidity") or {}).get("usd", 0) or 0
     volume_h1 = (best_pair.get("volume") or {}).get("h1", 0) or 0
 
     liq_pts = _liquidity_points(liquidity_usd)
@@ -128,5 +147,6 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         score=round(points, 1),
         reasons=reasons,
         liquidity_usd=liquidity_usd,
+        market_cap_usd=market_cap_usd,
         raw={"pair": best_pair, "rugcheck": rugcheck_report},
     )

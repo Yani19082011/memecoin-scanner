@@ -62,6 +62,7 @@ def test_email():
         score=99,
         reasons=["Това е тестов алърт за проверка на Resend интеграцията."],
         liquidity_usd=12345,
+        market_cap_usd=250000,
         raw={},
     )
     send_alert(fake)
