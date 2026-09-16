@@ -23,6 +23,7 @@ class MemeScoreResult:
     reasons: list = field(default_factory=list)
     liquidity_usd: float = 0.0
     market_cap_usd: float = 0.0
+    potential_label: str = ""
     raw: dict = field(default_factory=dict)
 
     @property
@@ -78,6 +79,24 @@ def _momentum_points(momentum_pct: float) -> float:
     return 0
 
 
+def classify_potential(market_cap_usd: float, momentum_pct: float, volume_h1: float, liquidity_usd: float) -> str:
+    """Чисто спекулативна, евристична етикетировка - НЕ прогноза и НЕ
+    финансов съвет. "Short squeeze" не съществува тук физически (graduated
+    pump.fun монети се търгуват само на обикновен AMM, няма borrow/маржин
+    механизъм за да се шортват - затова няма as смисъл такава категория).
+    Вместо това: груба преценка "колко рано сме" + "колко силен е моментума"."""
+    ratio = (volume_h1 / liquidity_usd) if liquidity_usd else 0
+
+    if market_cap_usd and market_cap_usd < 50_000 and momentum_pct >= 30 and ratio >= 1:
+        return ("🚀 Потенциален голям runner (нисък market cap + силен ранен моментум + висок обем) - "
+                "но силно спекулативно, повечето такива монети пак отиват на 0")
+    if momentum_pct >= 100:
+        return "⚠️ Вече силно изпомпана - влизаш късно, повишен риск точно сега да е dump, не продължение на pump-а"
+    if market_cap_usd and market_cap_usd < 100_000:
+        return "🌱 Все още малка по market cap - потенциал за растеж, но и стандартно висок rug риск за тази категория"
+    return "➖ Умерен/неясен потенциал по наличните данни"
+
+
 def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct: float = 0.0) -> MemeScoreResult:
     if not best_pair:
         return MemeScoreResult(mint=mint, score=0, reasons=["няма DexScreener pair - вероятно още не е индексиран"])
@@ -96,6 +115,22 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
             mint=mint,
             score=0,
             reasons=[f"ликвидност твърде ниска (${liquidity_usd:,.2f}) - под минимума ${config.MIN_LIQUIDITY_USD:,.0f}"],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
+
+    # Горен таван на market cap - целта е да хващаме монети РАНО, докато са
+    # все още малки, не след като вече са набъбнали значително. market_cap_usd
+    # може да е 0/непознат за съвсем нови монети (DexScreener още не го е
+    # изчислил) - в такъв случай НЕ филтрираме тук (нямаме основание да
+    # отхвърлим заради непозната стойност), но филтрираме твърдо, ако имаме
+    # реална стойност над прага.
+    if market_cap_usd and market_cap_usd > config.MAX_MARKET_CAP_USD:
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[f"market cap твърде висок (${market_cap_usd:,.0f}) - над лимита ${config.MAX_MARKET_CAP_USD:,.0f}, вече не е 'ранно' влизане"],
             liquidity_usd=liquidity_usd,
             market_cap_usd=market_cap_usd,
             raw={"pair": best_pair, "rugcheck": rugcheck_report},
@@ -122,25 +157,37 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         reasons.append(f"реален моментум +{momentum_pct:.1f}% откакто следим монетата")
 
     # RugCheck risk флагове - defensively, различни възможни имена на полета.
-    risks = rugcheck_report.get("risks") or []
-    risk_names = {str(r.get("name", "")).lower() for r in risks if isinstance(r, dict)}
-
-    if not any("mint" in n and "authority" in n for n in risk_names):
-        points += WEIGHTS["no_mint_authority"]
-        reasons.append("mint authority изглежда revoke-нат")
+    #
+    # ВАЖНО: ако rugcheck_report е празен (RugCheck още не е индексирал
+    # монетата - много чест случай секунди след graduation), ТОВА НЕ Е
+    # доказателство, че монетата е безопасна - просто нямаме данни. Преди
+    # тук се третираше "няма флагове" (защото няма доклад изобщо) като
+    # "чисто" и се даваха всичките 30 точки за риск - точно това пропускаше
+    # rug pull-ове, направени секунди след graduation, преди RugCheck да
+    # смогне да индексира монетата. Затова: без доклад -> 0 точки за риск,
+    # изрично предупреждение, вместо мълчаливо да приемем "безопасно".
+    if not rugcheck_report:
+        reasons.append("⚠️ RugCheck още няма доклад за тази монета (твърде нова) - риск точки НЕ се дават предпазливо")
     else:
-        reasons.append("⚠️ mint authority все още активен (може да се printne още токени)")
+        risks = rugcheck_report.get("risks") or []
+        risk_names = {str(r.get("name", "")).lower() for r in risks if isinstance(r, dict)}
 
-    if not any("freeze" in n for n in risk_names):
-        points += WEIGHTS["no_freeze_authority"]
-    else:
-        reasons.append("⚠️ freeze authority активен")
+        if not any("mint" in n and "authority" in n for n in risk_names):
+            points += WEIGHTS["no_mint_authority"]
+            reasons.append("mint authority изглежда revoke-нат")
+        else:
+            reasons.append("⚠️ mint authority все още активен (може да се printne още токени)")
 
-    high_severity = [r for r in risks if isinstance(r, dict) and str(r.get("level", "")).lower() in ("danger", "high")]
-    if len(high_severity) == 0:
-        points += WEIGHTS["low_risk_flags"]
-    else:
-        reasons.append(f"⚠️ {len(high_severity)} high-severity риск флага от RugCheck")
+        if not any("freeze" in n for n in risk_names):
+            points += WEIGHTS["no_freeze_authority"]
+        else:
+            reasons.append("⚠️ freeze authority активен")
+
+        high_severity = [r for r in risks if isinstance(r, dict) and str(r.get("level", "")).lower() in ("danger", "high")]
+        if len(high_severity) == 0:
+            points += WEIGHTS["low_risk_flags"]
+        else:
+            reasons.append(f"⚠️ {len(high_severity)} high-severity риск флага от RugCheck")
 
     return MemeScoreResult(
         mint=mint,
@@ -148,5 +195,6 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         reasons=reasons,
         liquidity_usd=liquidity_usd,
         market_cap_usd=market_cap_usd,
+        potential_label=classify_potential(market_cap_usd, momentum_pct, volume_h1, liquidity_usd),
         raw={"pair": best_pair, "rugcheck": rugcheck_report},
     )

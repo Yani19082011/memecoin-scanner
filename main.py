@@ -62,7 +62,8 @@ def test_email():
         score=99,
         reasons=["Това е тестов алърт за проверка на Resend интеграцията."],
         liquidity_usd=12345,
-        market_cap_usd=250000,
+        market_cap_usd=45000,
+        potential_label="🚀 Потенциален голям runner (нисък market cap + силен ранен моментум + висок обем) - но силно спекулативно, повечето такива монети пак отиват на 0",
         raw={},
     )
     send_alert(fake)
@@ -87,8 +88,13 @@ async def monitor_token(mint: str):
     try:
         await asyncio.sleep(config.INITIAL_INDEX_DELAY_SECONDS)
 
-        # RugCheck се дърпа веднъж в началото - mint/freeze/risk флаговете не
-        # се менят на всяка минута, няма смисъл да го питаме на всеки poll.
+        # RugCheck: опитваме пак на всеки poll, ДОКАТО не получим реален
+        # доклад - веднага след graduation монетата често още не е
+        # индексирана (празен report), а преди кодът приемаше "няма флагове"
+        # (защото няма доклад изобщо) като "монетата е чиста" и я score-ваше
+        # високо въпреки нулева реална риск-проверка. Затова продължаваме да
+        # питаме, докато RugCheck реално я индексира; веднъж получен доклад,
+        # спираме да питаме отново (флаговете не се менят всяка минута).
         rugcheck_report = get_rugcheck_report(mint)
 
         first_price = None
@@ -97,6 +103,8 @@ async def monitor_token(mint: str):
 
         while datetime.now(timezone.utc) < deadline:
             poll_num += 1
+            if not rugcheck_report:
+                rugcheck_report = get_rugcheck_report(mint)
             pairs = get_dexscreener_pairs(mint)
             best_pair = pairs[0] if pairs else {}
             price = _safe_float(best_pair.get("priceUsd"))

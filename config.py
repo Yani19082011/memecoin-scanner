@@ -22,6 +22,10 @@ POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 MONITOR_WINDOW_MINUTES = int(os.getenv("MONITOR_WINDOW_MINUTES", "45"))
 
 MIN_LIQUIDITY_USD = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
+# Горен праг на market cap - за да хващаме монети РАНО, преди да са
+# набъбнали много. Монета над този таван никога не се score-ва/алъртва,
+# независимо от другите фактори.
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "200000"))
 HIGH_POTENTIAL_THRESHOLD = float(os.getenv("HIGH_POTENTIAL_THRESHOLD", "65"))
 
 ALERT_EMAIL_ENABLED = _bool("ALERT_EMAIL_ENABLED", False)

@@ -27,6 +27,7 @@ def format_alert(result: MemeScoreResult) -> str:
         f"Score: {result.score}/100 | Потенциал: {result.estimated_multiplier}",
         f"Ликвидност: ${result.liquidity_usd:,.0f}",
         f"Market Cap: ${result.market_cap_usd:,.0f}" if result.market_cap_usd else "Market Cap: няма данни",
+        f"Оценка (спекулативна, НЕ прогноза): {result.potential_label}" if result.potential_label else "",
         f"DexScreener: {dexscreener_link}",
         "Причини: " + "; ".join(result.reasons) if result.reasons else "",
         "",
