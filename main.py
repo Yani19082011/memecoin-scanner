@@ -22,7 +22,7 @@ from flask import Flask
 
 import config
 from pumpportal_client import listen_for_migrations
-from data_sources import get_dexscreener_pairs_batch, get_rugcheck_report, extract_mint_address
+from data_sources import get_dexscreener_pairs_batch, get_dexscreener_pairs, get_rugcheck_report, extract_mint_address
 from scoring import score_token
 from seen_store import load_seen, mark_seen
 from notifier import send_alert
@@ -49,7 +49,7 @@ REQUIRED_CONFIG_ATTRS = [
     "MONITOR_WINDOW_MINUTES", "MIN_POLLS_BEFORE_ALERT", "PEAK_DRAWDOWN_STOP_PCT",
     "MIN_LP_LOCKED_PCT", "BLOCK_ON_LOW_LIQUIDITY_RISK", "MIN_LIQUIDITY_USD",
     "MAX_INSIDER_CLUSTERS", "RUGCHECK_REFRESH_EVERY_N_POLLS", "MAX_MARKET_CAP_USD",
-    "HIGH_POTENTIAL_THRESHOLD", "IMPERSONATION_KEYWORDS",
+    "HIGH_POTENTIAL_THRESHOLD", "FINAL_CHECK_MAX_DRAWDOWN_PCT", "IMPERSONATION_KEYWORDS",
     "IMPERSONATION_LEGITIMACY_WORDS", "ALERT_EMAIL_ENABLED", "RESEND_API_KEY",
     "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO", "MIN_EMAIL_INTERVAL_SECONDS",
     "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
@@ -253,9 +253,29 @@ async def monitor_token(mint: str):
                 already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
                 confirmed = consecutive_high_potential >= config.MIN_POLLS_BEFORE_ALERT
                 if confirmed and not already_rolling_over:
-                    send_alert(result)
-                    _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
-                    break
+                    # Финална live проверка "в последната секунда" - виж
+                    # config.FINAL_CHECK_MAX_DRAWDOWN_PCT. Директна свежа
+                    # DexScreener заявка (НЕ кеша, който е до
+                    # POLL_INTERVAL_SECONDS стар) точно преди да пратим -
+                    # хваща случая, в който монетата пада МЕЖДУ последното
+                    # потвърждение и реалния момент на изпращане.
+                    final_pairs = await asyncio.to_thread(get_dexscreener_pairs, mint)
+                    final_best_pair = final_pairs[0] if final_pairs else best_pair
+                    final_price = _safe_float(final_best_pair.get("priceUsd")) or price
+                    final_drawdown_pct = (
+                        ((peak_price - final_price) / peak_price * 100)
+                        if (peak_price and final_price) else drawdown_pct
+                    )
+                    if final_drawdown_pct >= config.FINAL_CHECK_MAX_DRAWDOWN_PCT:
+                        log.info(
+                            "%s: финалната проверка точно преди изпращане показа спад %.1f%% от пика "
+                            "(над прага %.1f%%) - отменям алърта в последния момент, монетата вече пада.",
+                            mint, final_drawdown_pct, config.FINAL_CHECK_MAX_DRAWDOWN_PCT,
+                        )
+                    else:
+                        send_alert(result)
+                        _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
+                        break
                 elif already_rolling_over:
                     log.info(
                         "%s: score е висок (%.1f), НО цената вече е паднала %.1f%% от пика - "
