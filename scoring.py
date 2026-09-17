@@ -99,21 +99,40 @@ def is_likely_impersonation(name: str, symbol: str) -> bool:
 
 
 def classify_potential(market_cap_usd: float, momentum_pct: float, volume_h1: float, liquidity_usd: float) -> str:
-    """Едно изречение, ВИНАГИ започващо с изричен "long runner: ДА/НЕ/НЕЯСНО"
-    отговор - чисто спекулативна, евристична преценка, НЕ прогноза и НЕ
-    финансов съвет. "Short squeeze" не съществува тук физически (graduated
-    pump.fun монети се търгуват само на обикновен AMM, няма borrow/маржин
-    механизъм за да се шортват - затова няма смисъл такава категория)."""
-    ratio = (volume_h1 / liquidity_usd) if liquidity_usd else 0
+    """Едно изречение, ВИНАГИ започващо с изричен "long runner: ДА/НЕ/ПО-СКОРО
+    ДА/ПО-СКОРО НЕ" отговор - чисто спекулативна, евристична преценка, НЕ
+    прогноза и НЕ финансов съвет.
 
-    if market_cap_usd and market_cap_usd < 50_000 and momentum_pct >= 30 and ratio >= 1:
-        return ("🚀 Long runner: ДА (спекулативно) - нисък market cap + силен ранен моментум + висок обем спрямо "
-                "ликвидност, но повечето такива монети пак отиват на 0")
-    if momentum_pct >= 100:
+    Преправено 17.09 по изрична обратна връзка на потребителя: старата
+    версия имаше широка "НЕЯСНО" категория (всичко под $100k market cap,
+    което не влизаше в другите клонове), която звучеше несигурно/неполезно
+    ("искам да не или към кое клониш"). Сега винаги накланяме към ДА или НЕ -
+    "НЕЯСНО" вече не съществува като отговор.
+
+    "Short squeeze" не съществува тук физически (graduated pump.fun монети
+    се търгуват само на обикновен AMM, няма borrow/маржин механизъм за да се
+    шортват - затова няма смисъл такава категория)."""
+    ratio = (volume_h1 / liquidity_usd) if liquidity_usd else 0
+    # "Комфортна" ликвидност - забележимо над голия минимум (MIN_LIQUIDITY_USD
+    # вече вдигнат на $15k заради сравнителния тест от 17.09 - виж config.py).
+    # Монета точно на прага е технически преминала филтъра, но не е
+    # "стабилна" в същия смисъл като една с 2-3x повече дълбочина.
+    comfortable_liquidity = liquidity_usd >= config.MIN_LIQUIDITY_USD * 1.5
+
+    if momentum_pct >= 80:
         return "⚠️ Long runner: НЕ - вече силно изпомпана, влизаш късно с повишен риск точно сега да е dump"
-    if market_cap_usd and market_cap_usd < 100_000:
-        return "🌱 Long runner: НЕЯСНО - все още малка по market cap с потенциал, но и стандартно висок rug риск"
-    return "➖ Long runner: НЕ - умерен/неясен потенциал по наличните данни"
+    if not comfortable_liquidity:
+        return (
+            f"⚠️ Long runner: ПО-СКОРО НЕ - ликвидността (${liquidity_usd:,.0f}) е близо до минимума, "
+            "не достатъчно дълбока да е стабилна (сравнителен тест 17.09: точно плитка ликвидност беше общото "
+            "при реални rug pull случаи)"
+        )
+    if market_cap_usd and market_cap_usd < 60_000 and momentum_pct >= 25 and ratio >= 1:
+        return ("🚀 Long runner: ПО-СКОРО ДА (спекулативно) - нисък market cap + силен ранен моментум + висок обем "
+                "спрямо ликвидност + стабилна ликвидна база, но повечето такива монети пак отиват на 0")
+    if market_cap_usd and market_cap_usd < 150_000:
+        return "🌱 Long runner: ПО-СКОРО ДА, предпазливо - все още малка по market cap, ликвидността е поне стабилна"
+    return "➖ Long runner: ПО-СКОРО НЕ - моментумът изглежда вече до голяма степен изразходван"
 
 
 def _weighted_lp_locked_pct(rugcheck_report: dict):
@@ -220,6 +239,34 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
             market_cap_usd=market_cap_usd,
             raw={"pair": best_pair, "rugcheck": rugcheck_report},
         )
+
+    # Твърд блок при explicit "Low Liquidity" RugCheck риск (на КАКЪВТО и да
+    # е level) - виж config.BLOCK_ON_LOW_LIQUIDITY_RISK за сравнителния тест
+    # от 17.09, който показа че точно този флаг беше единственото нещо общо
+    # между двете рeaлни rug-нали монети, липсващо при добрите. RugCheck-ският
+    # собствен алгоритъм явно вижда нещо в комбинацията от фактори (текуща
+    # ликвидност, дълбочина на пула и т.н.), което ние не преизчисляваме сами -
+    # затова просто му се доверяваме тук директно, вместо да пресмятаме
+    # собствен праг.
+    if config.BLOCK_ON_LOW_LIQUIDITY_RISK and rugcheck_report:
+        risks_list = rugcheck_report.get("risks") or []
+        low_liquidity_risk = next(
+            (r for r in risks_list if isinstance(r, dict) and "low liquidity" in str(r.get("name", "")).lower()),
+            None,
+        )
+        if low_liquidity_risk:
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=[
+                    f"⚠️ RugCheck директно флагна '{low_liquidity_risk.get('name')}' "
+                    f"(level={low_liquidity_risk.get('level')}) - и при двете rug-нали монети в сравнителния "
+                    "тест от 17.09 точно този флаг беше налице, при нито една от добрите - пропускам."
+                ],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
 
     reasons = []
     points = 0.0
