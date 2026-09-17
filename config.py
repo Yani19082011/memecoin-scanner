@@ -40,8 +40,22 @@ MONITOR_WINDOW_MINUTES = int(os.getenv("MONITOR_WINDOW_MINUTES", "45"))
 # първия възможен алърт - по избор на потребителя ("опитвай се да не
 # намираш повече такива"), приемаме да пропуснем някой и друг бърз мувър,
 # за да намалим лошите/мъртви алърти.
-MIN_POLLS_BEFORE_ALERT = int(os.getenv("MIN_POLLS_BEFORE_ALERT", "2"))
+MIN_POLLS_BEFORE_ALERT = int(os.getenv("MIN_POLLS_BEFORE_ALERT", "3"))
 PEAK_DRAWDOWN_STOP_PCT = float(os.getenv("PEAK_DRAWDOWN_STOP_PCT", "10"))
+# Вдигнато от 2 на 3 (17.09) - реален случай (TWOSIDES/68KXLo...): rug pull
+# малко след като алъртът е пратен - монетата явно е паднала между
+# последното потвърждение и реалността твърде бързо за 2 проверки (150с
+# общо). 3 проверки (210с общо, ~3.5 мин) дават малко повече време на
+# PEAK_DRAWDOWN_STOP_PCT защитата по-долу да хване обръщане надолу преди
+# да пратим - компромис е малко по-бавен алърт, за сметка на по-малко
+# "потвърдено, но реално вече мъртво" случаи.
+
+# На всеки колко проверки да опресняваме RugCheck доклада наново (не само
+# докато е бил празен) - виж коментара в main.py::monitor_token за реалния
+# rug pull случай (17.09), който показа че стар/остарял RugCheck доклад
+# може да продължи да изглежда "чист" дълго след като монетата реално се е
+# влошила (нова Low Liquidity/insider флагове, паднал LP lock %).
+RUGCHECK_REFRESH_EVERY_N_POLLS = int(os.getenv("RUGCHECK_REFRESH_EVERY_N_POLLS", "2"))
 
 # --- Защита срещу "liquidity rug" (LP не е заключен) ---
 # Реален случай (17.09): монета score=76, mint authority revoke-нат, freeze

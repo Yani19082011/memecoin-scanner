@@ -201,6 +201,7 @@ async def monitor_token(mint: str):
 
         first_price = None
         peak_price = None
+        consecutive_high_potential = 0
         deadline = datetime.now(timezone.utc) + timedelta(minutes=config.MONITOR_WINDOW_MINUTES)
         poll_num = 0
 
@@ -231,11 +232,26 @@ async def monitor_token(mint: str):
                 "; ".join(result.reasons),
             )
 
+            # Защита срещу "купуване на върха" / еднократен spike - виж
+            # config.MIN_POLLS_BEFORE_ALERT. РЕАЛЕН БЪГ (17.09, TWOSIDES/
+            # 68KXLo... rug pull малко след алърт): преди тук проверявахме
+            # "poll_num >= MIN_POLLS_BEFORE_ALERT" - т.е. САМО колко общо
+            # проверки сме направили откакто следим монетата, НЕ колко от
+            # тях подред са били над прага. Монета можеше да е боклук на
+            # poll #1-2 и да получи ЕДИНСТВЕН случаен (wash-trading) spike
+            # точно на poll #3 - и понеже 3 >= MIN_POLLS_BEFORE_ALERT(3), се
+            # третираше като "потвърдено" и пращахме алърт веднага, без
+            # реално нито едно предишно потвърждение. Сега броим ПОСЛЕДОВАТЕЛНИ
+            # high-potential резултати (нулира се веднага щом score падне под
+            # прага) - същия принцип, който вече ползваме в PennyStockScanner.
             if result.is_high_potential:
-                # Защита срещу "купуване на върха" - виж коментара при
-                # MIN_POLLS_BEFORE_ALERT/PEAK_DRAWDOWN_STOP_PCT в config.py.
+                consecutive_high_potential += 1
+            else:
+                consecutive_high_potential = 0
+
+            if result.is_high_potential:
                 already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
-                confirmed = poll_num >= config.MIN_POLLS_BEFORE_ALERT
+                confirmed = consecutive_high_potential >= config.MIN_POLLS_BEFORE_ALERT
                 if confirmed and not already_rolling_over:
                     send_alert(result)
                     _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
@@ -248,9 +264,9 @@ async def monitor_token(mint: str):
                     )
                 else:
                     log.info(
-                        "%s: score е висок (%.1f) на poll #%d, чакам поне %d последователни "
-                        "проверки над прага преди да пратя алърт.",
-                        mint, result.score, poll_num, config.MIN_POLLS_BEFORE_ALERT,
+                        "%s: score е висок (%.1f) - %d/%d последователни проверки над прага, "
+                        "чакам още преди да пратя алърт.",
+                        mint, result.score, consecutive_high_potential, config.MIN_POLLS_BEFORE_ALERT,
                     )
 
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
