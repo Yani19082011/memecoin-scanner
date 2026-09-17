@@ -10,11 +10,23 @@ Wrapper-и над публичните безплатни API-та за on-chain
 тук, ако DexScreener/RugCheck са сменили схемата си междувременно.
 """
 import logging
+import time
+
 import requests
 
 import config
 
 log = logging.getLogger("data_sources")
+
+# Retry при 429 от DexScreener - живи Render логове (17.09) показаха, че
+# ДОРИ след batch-ването (1 заявка за 8 адреса вместо 8 отделни) пак
+# получаваме 429 - значи лимитът е по-строг от очакваното, или Render
+# безплатният tier споделя изходящ IP с други потребители, които вече го
+# наближават (извън наш контрол). Кратко изчакване + retry често е
+# достатъчно, защото повечето подобни лимити са rolling-window (изчистват
+# се след няколко секунди), не твърд таван за деня.
+DEXSCREENER_MAX_RETRIES = 3
+DEXSCREENER_RETRY_BASE_DELAY_SECONDS = 3
 
 
 def _sort_pairs_by_liquidity(pairs: list[dict]) -> list[dict]:
@@ -45,6 +57,39 @@ def get_dexscreener_pairs(mint_address: str) -> list[dict]:
 DEXSCREENER_BATCH_SIZE = 30
 
 
+def _fetch_dexscreener_chunk(chunk: list[str]):
+    """Едно HTTP повикване за един chunk от адреси, с retry+backoff при 429.
+    Връща списъка от pairs (може да е []), или None ако всички опити
+    паднаха (извикващият код тогава просто пропуска този chunk тази
+    обиколка - следващата обиколка ще опита пак)."""
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
+    delay = DEXSCREENER_RETRY_BASE_DELAY_SECONDS
+
+    for attempt in range(1, DEXSCREENER_MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429:
+                if attempt < DEXSCREENER_MAX_RETRIES:
+                    log.warning(
+                        "DexScreener 429 за %d адреса (опит %d/%d) - изчаквам %dс и пробвам пак...",
+                        len(chunk), attempt, DEXSCREENER_MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                log.warning(
+                    "DexScreener 429 за %d адреса - изчерпани %d опита, пропускам този chunk тази обиколка.",
+                    len(chunk), DEXSCREENER_MAX_RETRIES,
+                )
+                return None
+            r.raise_for_status()
+            return r.json().get("pairs") or []
+        except Exception as e:
+            log.warning("DexScreener batch fail за %d адреса: %s", len(chunk), e)
+            return None
+    return None
+
+
 def get_dexscreener_pairs_batch(mint_addresses: list[str]) -> dict[str, list[dict]]:
     """Batch версия на get_dexscreener_pairs() - ЕДНА HTTP заявка за до
     DEXSCREENER_BATCH_SIZE адреса наведнъж, вместо по една заявка на монета.
@@ -65,14 +110,9 @@ def get_dexscreener_pairs_batch(mint_addresses: list[str]) -> dict[str, list[dic
 
     for i in range(0, len(mint_addresses), DEXSCREENER_BATCH_SIZE):
         chunk = mint_addresses[i:i + DEXSCREENER_BATCH_SIZE]
-        url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            pairs = r.json().get("pairs") or []
-        except Exception as e:
-            log.warning("DexScreener batch fail за %d адреса: %s", len(chunk), e)
-            continue
+        pairs = _fetch_dexscreener_chunk(chunk)
+        if pairs is None:
+            continue  # изчерпани retry опити за този chunk - пропускаме тази обиколка
 
         chunk_set = set(chunk)
         for pair in pairs:
