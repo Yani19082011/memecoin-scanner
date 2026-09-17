@@ -276,6 +276,31 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
                 raw={"pair": best_pair, "rugcheck": rugcheck_report},
             )
 
+    # Твърд блок при екстремна insider концентрация - виж config.MAX_INSIDER_CLUSTERS.
+    # Реален случай (17.09): TRUPAI ("Trump Paid") - 33 insider клъстъра (5
+    # отделни мрежи, до 9 wallet-а в една) - несравнимо повече от SVEN
+    # (легитимно добра монета, +518%, само 4 клъстъра/4.55% от supply), затова
+    # преди не пипахме прага (виж по-долу - под прага си остава чисто
+    # информативно). TRUPAI вече се блокираше и на ликвидност/Low-Liquidity
+    # флага по-горе, но добавяме тази защита директно, за бъдещи случаи, при
+    # които ликвидността може да изглежда ОК, а insider концентрацията пак е
+    # екстремна - 33 е категорично различен мащаб от "няколко клъстъра", не
+    # просто малко над средното.
+    insiders_detected_check = (rugcheck_report.get("graphInsidersDetected") or 0) if rugcheck_report else 0
+    if insiders_detected_check >= config.MAX_INSIDER_CLUSTERS:
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[
+                f"⚠️ RugCheck откри {insiders_detected_check} insider wallet клъстъра - над прага "
+                f"{config.MAX_INSIDER_CLUSTERS:.0f} (за сравнение: SVEN, легитимно добра монета, имаше само 4) - "
+                "твърде концентрирано разпределение, пропускам независимо от другите фактори."
+            ],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
+
     reasons = []
     points = 0.0
 
@@ -329,15 +354,14 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         else:
             reasons.append(f"⚠️ {len(high_severity)} high-severity риск флага от RugCheck")
 
-        # Само ИНФОРМАТИВНО (не пипа score-а) - сравнителен тест (17.09) на
-        # реални изходи показа, че "graphInsidersDetected > 0" присъстваше
-        # при rug/decline случаите, НО и при поне един легитимно добър случай
-        # (SVEN, +518%, 4 клъстъра/4.55% от supply) - не е достатъчно чист
-        # сигнал за твърд блок или наказание в score-а, само за прозрачност
-        # в самия имейл, за да можеш ти да прецениш.
-        insiders_detected = rugcheck_report.get("graphInsidersDetected") or 0
-        if insiders_detected:
-            reasons.append(f"ℹ️ RugCheck откри {insiders_detected} insider wallet клъстър(а) - информативно, не блокира сам по себе си")
+        # Само ИНФОРМАТИВНО (не пипа score-а) - под прага MAX_INSIDER_CLUSTERS
+        # (виж твърдия блок по-горе за над-прага случая). Сравнителен тест
+        # (17.09) показа, че "graphInsidersDetected > 0" присъстваше при rug/
+        # decline случаите, НО и при поне един легитимно добър случай (SVEN,
+        # +518%, 4 клъстъра/4.55% от supply) - под прага не е достатъчно чист
+        # сигнал за наказание в score-а, само за прозрачност в имейла.
+        if insiders_detected_check:
+            reasons.append(f"ℹ️ RugCheck откри {insiders_detected_check} insider wallet клъстър(а) - под прага, информативно")
 
     return MemeScoreResult(
         mint=mint,

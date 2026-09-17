@@ -48,7 +48,8 @@ REQUIRED_CONFIG_ATTRS = [
     "PUMPPORTAL_WS_URL", "INITIAL_INDEX_DELAY_SECONDS", "POLL_INTERVAL_SECONDS",
     "MONITOR_WINDOW_MINUTES", "MIN_POLLS_BEFORE_ALERT", "PEAK_DRAWDOWN_STOP_PCT",
     "MIN_LP_LOCKED_PCT", "BLOCK_ON_LOW_LIQUIDITY_RISK", "MIN_LIQUIDITY_USD",
-    "MAX_MARKET_CAP_USD", "HIGH_POTENTIAL_THRESHOLD", "IMPERSONATION_KEYWORDS",
+    "MAX_INSIDER_CLUSTERS", "RUGCHECK_REFRESH_EVERY_N_POLLS", "MAX_MARKET_CAP_USD",
+    "HIGH_POTENTIAL_THRESHOLD", "IMPERSONATION_KEYWORDS",
     "IMPERSONATION_LEGITIMACY_WORDS", "ALERT_EMAIL_ENABLED", "RESEND_API_KEY",
     "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO", "MIN_EMAIL_INTERVAL_SECONDS",
     "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
@@ -180,11 +181,22 @@ async def monitor_token(mint: str):
         # доклад - веднага след graduation монетата често още не е
         # индексирана (празен report), а преди кодът приемаше "няма флагове"
         # (защото няма доклад изобщо) като "монетата е чиста" и я score-ваше
-        # високо въпреки нулева реална риск-проверка. Затова продължаваме да
-        # питаме, докато RugCheck реално я индексира; веднъж получен доклад,
-        # спираме да питаме отново (флаговете не се менят всяка минута).
-        # RugCheck няма потвърден batch endpoint - остава per-mint, но в
-        # отделна нишка (to_thread), за да не блокира целия event loop.
+        # високо въпреки нулева реална риск-проверка.
+        #
+        # ВАЖНО (17.09, реален rug pull малко след алърт - TWOSIDES/68KXLo...):
+        # преди спирахме да питаме RugCheck ОТНОВО веднага щом получим първи
+        # непразен доклад - и после го ползвахме до 45 мин напред, без да го
+        # опресняваме. Проблемът: RugCheck-ските рискови флагове (Low
+        # Liquidity, LP lock %, insider клъстъри) се менят в реално време
+        # заедно с монетата - ако първият доклад е хванат рано (преди
+        # ликвидността да е пропаднала или insider клъстъри да са открити),
+        # монетата може да мине филтрите на poll #1-2 с "чист" стар доклад,
+        # докато реалната картина вече се е влошила. Затова сега опресняваме
+        # RugCheck периодично (на всеки config.RUGCHECK_REFRESH_EVERY_N_POLLS
+        # проверки), не само докато е бил празен - живата DexScreener
+        # ликвидност/цена вече се опресняват на всеки poll, но RugCheck
+        # флаговете не бяха. Пазим стария доклад, ако новата заявка се провали
+        # временно (НЕ го трием заради мрежова грешка).
         rugcheck_report = await asyncio.to_thread(get_rugcheck_report, mint)
 
         first_price = None
@@ -194,8 +206,11 @@ async def monitor_token(mint: str):
 
         while datetime.now(timezone.utc) < deadline:
             poll_num += 1
-            if not rugcheck_report:
-                rugcheck_report = await asyncio.to_thread(get_rugcheck_report, mint)
+            should_refresh_rugcheck = (not rugcheck_report) or (poll_num % config.RUGCHECK_REFRESH_EVERY_N_POLLS == 0)
+            if should_refresh_rugcheck:
+                fresh_rugcheck = await asyncio.to_thread(get_rugcheck_report, mint)
+                if fresh_rugcheck:
+                    rugcheck_report = fresh_rugcheck
             # Четем от споделения кеш (пълни се от _refresh_market_data_loop),
             # НЕ директна HTTP заявка тук - виж коментара при _market_data_cache.
             pairs = _market_data_cache.get(mint) or []
