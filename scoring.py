@@ -116,6 +116,32 @@ def classify_potential(market_cap_usd: float, momentum_pct: float, volume_h1: fl
     return "➖ Long runner: НЕ - умерен/неясен потенциал по наличните данни"
 
 
+def _weighted_lp_locked_pct(rugcheck_report: dict):
+    """Претеглена % заключена ликвидност (LP lock) - претеглена по реалния
+    дял (pctReserve) на всеки market/pool от общата ликвидност, НЕ проста
+    средна стойност. Виж config.MIN_LP_LOCKED_PCT за защо - монета с 2
+    pool-а (единият 100% locked но 3% от резерва, другият 0% locked но 97%
+    от резерва) НЕ е "50% locked" - реално е ~3% заключена ликвидност, и
+    точно това пропуска RugCheck-ският собствен 'risks' масив.
+    Връща None ако нямаме markets/lp данни (нов доклад, все още неиндексиран
+    market и т.н.) - в такъв случай НЕ блокираме тук (недостатъчно данни),
+    другите защити (liquidity floor, no report предупреждение) си остават."""
+    markets = rugcheck_report.get("markets") or []
+    total_weight = 0.0
+    weighted_locked = 0.0
+    for market in markets:
+        lp = (market or {}).get("lp") or {}
+        pct_reserve = lp.get("pctReserve")
+        locked_pct = lp.get("lpLockedPct")
+        if pct_reserve is None or locked_pct is None:
+            continue
+        total_weight += pct_reserve
+        weighted_locked += pct_reserve * locked_pct
+    if total_weight <= 0:
+        return None
+    return weighted_locked / total_weight
+
+
 def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct: float = 0.0) -> MemeScoreResult:
     if not best_pair:
         return MemeScoreResult(mint=mint, score=0, reasons=["няма DexScreener pair - вероятно още не е индексиран"])
@@ -170,6 +196,26 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
             mint=mint,
             score=0,
             reasons=[f"market cap твърде висок (${market_cap_usd:,.0f}) - над лимита ${config.MAX_MARKET_CAP_USD:,.0f}, вече не е 'ранно' влизане"],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
+
+    # Твърд филтър за незаключена ликвидност ("liquidity rug") - виж
+    # config.MIN_LP_LOCKED_PCT за реалния случай, който доведе до това.
+    # Проверяваме САМО ако имаме markets/lp данни - липса на данни тук НЕ
+    # означава "безопасно", просто нямаме основание да блокираме конкретно
+    # заради това (другите защити си остават).
+    lp_locked_pct = _weighted_lp_locked_pct(rugcheck_report) if rugcheck_report else None
+    if lp_locked_pct is not None and lp_locked_pct < config.MIN_LP_LOCKED_PCT:
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[
+                f"⚠️ само ~{lp_locked_pct:.0f}% от ликвидността е заключена (LP lock), претеглено по реалния "
+                f"дял на всеки pool - под минимума {config.MIN_LP_LOCKED_PCT:.0f}%. Собственикът може да изтегли "
+                "незаключената ликвидност по всяко време ('liquidity rug') - пропускам, независимо от другите фактори."
+            ],
             liquidity_usd=liquidity_usd,
             market_cap_usd=market_cap_usd,
             raw={"pair": best_pair, "rugcheck": rugcheck_report},

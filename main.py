@@ -98,6 +98,7 @@ async def monitor_token(mint: str):
         rugcheck_report = get_rugcheck_report(mint)
 
         first_price = None
+        peak_price = None
         deadline = datetime.now(timezone.utc) + timedelta(minutes=config.MONITOR_WINDOW_MINUTES)
         poll_num = 0
 
@@ -111,19 +112,39 @@ async def monitor_token(mint: str):
 
             if first_price is None and price:
                 first_price = price
+            if price:
+                peak_price = max(peak_price, price) if peak_price else price
             momentum_pct = ((price - first_price) / first_price * 100) if (first_price and price) else 0.0
+            drawdown_pct = ((peak_price - price) / peak_price * 100) if (peak_price and price) else 0.0
 
             result = score_token(mint, best_pair, rugcheck_report, momentum_pct)
             log.info(
-                "[%s] poll #%d score=%.1f моментум=%.1f%% ликвидност=$%.0f (%s)",
-                mint, poll_num, result.score, momentum_pct, result.liquidity_usd,
+                "[%s] poll #%d score=%.1f моментум=%.1f%% спад_от_пика=%.1f%% ликвидност=$%.0f (%s)",
+                mint, poll_num, result.score, momentum_pct, drawdown_pct, result.liquidity_usd,
                 "; ".join(result.reasons),
             )
 
             if result.is_high_potential:
-                send_alert(result)
-                _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
-                break
+                # Защита срещу "купуване на върха" - виж коментара при
+                # MIN_POLLS_BEFORE_ALERT/PEAK_DRAWDOWN_STOP_PCT в config.py.
+                already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
+                confirmed = poll_num >= config.MIN_POLLS_BEFORE_ALERT
+                if confirmed and not already_rolling_over:
+                    send_alert(result)
+                    _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
+                    break
+                elif already_rolling_over:
+                    log.info(
+                        "%s: score е висок (%.1f), НО цената вече е паднала %.1f%% от пика - "
+                        "най-вероятно върхът е изпуснат, пропускам алърта.",
+                        mint, result.score, drawdown_pct,
+                    )
+                else:
+                    log.info(
+                        "%s: score е висок (%.1f) на poll #%d, чакам поне %d последователни "
+                        "проверки над прага преди да пратя алърт.",
+                        mint, result.score, poll_num, config.MIN_POLLS_BEFORE_ALERT,
+                    )
 
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
         else:
