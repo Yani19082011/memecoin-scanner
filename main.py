@@ -22,7 +22,7 @@ from flask import Flask
 
 import config
 from pumpportal_client import listen_for_migrations
-from data_sources import get_dexscreener_pairs, get_rugcheck_report, extract_mint_address
+from data_sources import get_dexscreener_pairs_batch, get_rugcheck_report, extract_mint_address
 from scoring import score_token
 from seen_store import load_seen, mark_seen
 from notifier import send_alert
@@ -43,6 +43,15 @@ _status = {
 }
 _seen = load_seen()
 _monitoring = set()
+
+# Споделен кеш с последните DexScreener данни за всяка следена монета -
+# пълни се от ЕДИН централен loop (_refresh_market_data_loop), който прави
+# batch заявки (до 30 адреса наведнъж) вместо всяка следена монета да си
+# праща собствена HTTP заявка на всеки poll. Причина (17.09, живи Render
+# логове): при 20+ едновременно следени монети, толкова отделни заявки на
+# всеки ~60с редовно удряха DexScreener rate limit-а (429 Too Many Requests),
+# което губеше/забавяше ценови данни точно когато монетата реално мърда.
+_market_data_cache: dict = {}
 
 
 @app.route("/")
@@ -81,6 +90,29 @@ def _safe_float(val) -> float:
         return 0.0
 
 
+async def _refresh_market_data_loop():
+    """Централен loop - batch-ва DexScreener заявки за ВСИЧКИ следени в
+    момента монети наведнъж (виж data_sources.get_dexscreener_pairs_batch),
+    вместо всяка от monitor_token() task-овете да пита поотделно. Тече
+    независимо от индивидуалните monitor_token() задачи, докато процесът е
+    жив - виж коментара при _market_data_cache по-горе за причината."""
+    while True:
+        try:
+            mints = list(_monitoring)
+            if mints:
+                fresh = await asyncio.to_thread(get_dexscreener_pairs_batch, mints)
+                _market_data_cache.update(fresh)
+                # чистим кеша от монети, които вече не следим (излезли от
+                # monitor_token поради timeout/алърт/грешка) - да не расте
+                # неограничено през дни наред работа на процеса.
+                for stale_mint in list(_market_data_cache.keys()):
+                    if stale_mint not in _monitoring:
+                        _market_data_cache.pop(stale_mint, None)
+        except Exception as e:
+            log.warning("Грешка в централния market-data refresh loop: %s", e)
+        await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+
 async def monitor_token(mint: str):
     """Следи монетата на живо и праща алърт веднага щом пресече прага -
     вместо да чака фиксирано изчакване и да провери само веднъж."""
@@ -95,7 +127,9 @@ async def monitor_token(mint: str):
         # високо въпреки нулева реална риск-проверка. Затова продължаваме да
         # питаме, докато RugCheck реално я индексира; веднъж получен доклад,
         # спираме да питаме отново (флаговете не се менят всяка минута).
-        rugcheck_report = get_rugcheck_report(mint)
+        # RugCheck няма потвърден batch endpoint - остава per-mint, но в
+        # отделна нишка (to_thread), за да не блокира целия event loop.
+        rugcheck_report = await asyncio.to_thread(get_rugcheck_report, mint)
 
         first_price = None
         peak_price = None
@@ -105,8 +139,10 @@ async def monitor_token(mint: str):
         while datetime.now(timezone.utc) < deadline:
             poll_num += 1
             if not rugcheck_report:
-                rugcheck_report = get_rugcheck_report(mint)
-            pairs = get_dexscreener_pairs(mint)
+                rugcheck_report = await asyncio.to_thread(get_rugcheck_report, mint)
+            # Четем от споделения кеш (пълни се от _refresh_market_data_loop),
+            # НЕ директна HTTP заявка тук - виж коментара при _market_data_cache.
+            pairs = _market_data_cache.get(mint) or []
             best_pair = pairs[0] if pairs else {}
             price = _safe_float(best_pair.get("priceUsd"))
 
@@ -177,6 +213,7 @@ def _run_async_loop():
         loop.create_task(on_migration(event))
 
     _status["started_at"] = datetime.now(timezone.utc).isoformat()
+    loop.create_task(_refresh_market_data_loop())
     loop.run_until_complete(listen_for_migrations(_dispatch))
 
 
