@@ -33,6 +33,62 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+# --- Стартова самопроверка ---
+# Реален случай (17.09): локалният config.py беше стара версия - липсваше
+# config.BLOCK_ON_LOW_LIQUIDITY_RISK - и score_token() гърмеше с
+# AttributeError за АБСОЛЮТНО ВСЯКА монета. Ботът изглеждаше "жив"
+# (health-check-ът минаваше, PumpPortal слушаше), но реално не пращаше
+# НИКАКЪВ алърт часове наред, защото всяка monitor_token() задача умираше
+# тихо на първия score_token() опит (само WARNING в логовете, по един ред
+# на монета - лесно за пропускане). _startup_self_check() хваща точно
+# този клас бъг (config.py разминат/непълен спрямо scoring.py) веднага при
+# стартиране, с ясна CRITICAL грешка и спиране на процеса, вместо часове/
+# дни по-късно да разбираме случайно от липсващи алърти.
+REQUIRED_CONFIG_ATTRS = [
+    "PUMPPORTAL_WS_URL", "INITIAL_INDEX_DELAY_SECONDS", "POLL_INTERVAL_SECONDS",
+    "MONITOR_WINDOW_MINUTES", "MIN_POLLS_BEFORE_ALERT", "PEAK_DRAWDOWN_STOP_PCT",
+    "MIN_LP_LOCKED_PCT", "BLOCK_ON_LOW_LIQUIDITY_RISK", "MIN_LIQUIDITY_USD",
+    "MAX_MARKET_CAP_USD", "HIGH_POTENTIAL_THRESHOLD", "IMPERSONATION_KEYWORDS",
+    "IMPERSONATION_LEGITIMACY_WORDS", "ALERT_EMAIL_ENABLED", "RESEND_API_KEY",
+    "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO", "MIN_EMAIL_INTERVAL_SECONDS",
+    "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
+]
+
+
+def _startup_self_check():
+    missing = [name for name in REQUIRED_CONFIG_ATTRS if not hasattr(config, name)]
+    if missing:
+        log.critical(
+            "СТАРТОВА ПРОВЕРКА ПРОВАЛЕНА: config.py липсват настройки: %s. "
+            "Най-вероятно файлът (локално или на Render) е стара/непълна версия - "
+            "провери git push/pull и redeploy-ни. Спирам стартирането, вместо да "
+            "оставя всяка монета да крашва тихо във фона.",
+            ", ".join(missing),
+        )
+        raise SystemExit(1)
+
+    fake_pair = {
+        "liquidity": {"usd": 20000},
+        "marketCap": 50000,
+        "fdv": 50000,
+        "baseToken": {"name": "SelfTestCoin", "symbol": "SELFTEST"},
+        "volume": {"h1": 10000},
+    }
+    fake_rugcheck = {"risks": [], "markets": [], "graphInsidersDetected": 0}
+    try:
+        score_token("SelfTest11111111111111111111111111111111111", fake_pair, fake_rugcheck, momentum_pct=30.0)
+    except Exception as e:
+        log.critical(
+            "СТАРТОВА ПРОВЕРКА ПРОВАЛЕНА: score_token() гърми на синтетичен тест "
+            "(%s) - има бъг/несъответствие между config.py и scoring.py. Спирам "
+            "стартирането, вместо да оставя всяка монета да крашва тихо.",
+            e,
+        )
+        raise SystemExit(1)
+
+    log.info("Стартова самопроверка: config.py и scoring.py изглеждат съвместими.")
+
+
 app = Flask(__name__)
 _status = {
     "started_at": None,
@@ -218,6 +274,7 @@ def _run_async_loop():
 
 
 def main():
+    _startup_self_check()
     thread = threading.Thread(target=_run_async_loop, daemon=True)
     thread.start()
     app.run(host="0.0.0.0", port=config.PORT)

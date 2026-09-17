@@ -329,6 +329,16 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         else:
             reasons.append(f"⚠️ {len(high_severity)} high-severity риск флага от RugCheck")
 
+        # Само ИНФОРМАТИВНО (не пипа score-а) - сравнителен тест (17.09) на
+        # реални изходи показа, че "graphInsidersDetected > 0" присъстваше
+        # при rug/decline случаите, НО и при поне един легитимно добър случай
+        # (SVEN, +518%, 4 клъстъра/4.55% от supply) - не е достатъчно чист
+        # сигнал за твърд блок или наказание в score-а, само за прозрачност
+        # в самия имейл, за да можеш ти да прецениш.
+        insiders_detected = rugcheck_report.get("graphInsidersDetected") or 0
+        if insiders_detected:
+            reasons.append(f"ℹ️ RugCheck откри {insiders_detected} insider wallet клъстър(а) - информативно, не блокира сам по себе си")
+
     return MemeScoreResult(
         mint=mint,
         score=round(points, 1),
