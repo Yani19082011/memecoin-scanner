@@ -21,7 +21,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import requests
-from flask import Flask
+from flask import Flask, request
 
 import config
 from pumpportal_client import listen_for_migrations
@@ -137,6 +137,23 @@ _monitoring_lock = threading.Lock()
 # което губеше/забавяше ценови данни точно когато монетата реално мърда.
 _market_data_cache: dict = {}
 
+# --- Данни за "Провери сега" бутона на /dashboard (18.09, по избор на
+# потребителя - "искам сайт с бутон, като го натисна да ми дава адрес") ---
+# ВАЖНО: ботът НЕ работи по фиксиран списък, който да сканира при поискване
+# (за разлика от PennyStockScanner) - монетите идват в реално време през
+# PumpPortal WebSocket. Затова бутонът не "сканира наново", а показва
+# най-добрата информация, която ботът вече има В МОМЕНТА:
+#   1. _recent_alerts - монети, които РЕАЛНО минаха всички твърди защити И
+#      прага (config.HIGH_POTENTIAL_THRESHOLD) - същите като имейл алъртите.
+#   2. Ако няма скорошен алърт - _latest_scores - най-високият текущ score
+#      измежду В МОМЕНТА следените монети, дори да е под прага (показва се
+#      ясно като "все още не потвърдена", за да не подвежда).
+_latest_scores: dict = {}
+_latest_scores_lock = threading.Lock()
+_recent_alerts: list = []
+_recent_alerts_lock = threading.Lock()
+MAX_RECENT_ALERTS = 20
+
 
 @app.route("/")
 def health():
@@ -166,6 +183,106 @@ def test_email():
     if not config.RESEND_API_KEY:
         return {"sent": False, "reason": "RESEND_API_KEY липсва - провери Render Environment Variables."}
     return {"sent": True, "to": config.ALERT_EMAIL_TO, "note": "Провери логовете (Logs таб) и пощата си."}
+
+
+def _candidate_card_html(mint: str, data: dict, confirmed: bool) -> str:
+    score = data.get("score", 0)
+    reasons = data.get("reasons") or []
+    potential_label = data.get("potential_label", "")
+    liquidity_usd = data.get("liquidity_usd", 0) or 0
+    market_cap_usd = data.get("market_cap_usd", 0) or 0
+    dexscreener_link = f"https://dexscreener.com/solana/{mint}"
+    pumpfun_link = f"https://pump.fun/coin/{mint}"
+    solscan_link = f"https://solscan.io/token/{mint}"
+    status_html = (
+        '<p style="color:#0a8a3f;font-weight:600;margin:0 0 10px;">'
+        '✅ Потвърден алърт - мина всички защити и прага (същото като имейла).</p>'
+        if confirmed else
+        '<p style="color:#a66b00;font-weight:600;margin:0 0 10px;">'
+        '⏳ Все още се следи в момента - НЕ е потвърдена (score под прага, или чака още последователни '
+        'проверки) - показвам я само защото е най-добрата налична в момента.</p>'
+    )
+    market_cap_html = f"${market_cap_usd:,.0f}" if market_cap_usd else "няма данни"
+    potential_html = f"<p style='margin:0 0 10px;'>{potential_label}</p>" if potential_label else ""
+    reasons_html = (
+        "<p class='muted' style='margin:8px 0 0;'>" + "; ".join(reasons) + "</p>"
+    ) if reasons else ""
+    return f"""
+    <div class="card">
+      {status_html}
+      <p style="margin:0 0 6px;"><b>Score:</b> {score}/100</p>
+      <p style="margin:0 0 10px;"><b>Ликвидност:</b> ${liquidity_usd:,.0f} | <b>Market Cap:</b> {market_cap_html}</p>
+      {potential_html}
+      <p class="addr">{mint}</p>
+      <p style="margin:10px 0 0;">
+        <a class="link" href="{dexscreener_link}" target="_blank" rel="noopener">DexScreener →</a> ·
+        <a class="link" href="{pumpfun_link}" target="_blank" rel="noopener">pump.fun →</a> ·
+        <a class="link" href="{solscan_link}" target="_blank" rel="noopener">Solscan →</a>
+      </p>
+      {reasons_html}
+    </div>
+    """
+
+
+def _render_best_candidate_html() -> str:
+    with _recent_alerts_lock:
+        alerts_snapshot = list(_recent_alerts)
+    if alerts_snapshot:
+        best = alerts_snapshot[0]
+        return _candidate_card_html(best["mint"], best, confirmed=True)
+
+    with _latest_scores_lock:
+        scores_snapshot = dict(_latest_scores)
+    if scores_snapshot:
+        best_mint, best_data = max(scores_snapshot.items(), key=lambda kv: kv[1].get("score", 0))
+        return _candidate_card_html(best_mint, best_data, confirmed=False)
+
+    return (
+        '<div class="card"><p style="margin:0;">В момента не следим нито една нова монета '
+        '(или е твърде рано след стартиране на бота) - пробвай пак след малко.</p></div>'
+    )
+
+
+_DASHBOARD_PAGE = """<!doctype html>
+<html lang="bg">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memecoin Scanner</title>
+<style>
+  body {{ font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; max-width: 560px; margin: 32px auto;
+          padding: 0 16px 40px; color:#12161f; background:#f7f8fa; }}
+  h1 {{ font-size: 21px; margin-bottom: 4px; }}
+  .muted {{ color:#666f80; font-size:13px; }}
+  .btn {{ display:inline-block; background:#5b47e0; color:#fff !important; padding:14px 30px; border-radius:10px;
+          font-size:16px; font-weight:600; text-decoration:none; border:none; cursor:pointer; margin-top:14px; }}
+  .card {{ background:#fff; border:1px solid #dde1e8; border-radius:12px; padding:18px; margin-top:20px; }}
+  .addr {{ font-family:'SFMono-Regular',Consolas,monospace; font-size:14px; word-break:break-all;
+           background:#f1f3f6; padding:12px; border-radius:8px; user-select:all; -webkit-user-select:all; }}
+  a.link {{ color:#5b47e0; text-decoration:none; }}
+</style>
+</head>
+<body>
+  <h1>🚀 Memecoin Scanner</h1>
+  <p class="muted">Ботът следи новите graduated монети на живо (PumpPortal) и праща email алърти автоматично,
+  независимо дали отваряш тази страница. Бутонът показва коя монета изглежда най-добре, по преценка на бота,
+  В МОМЕНТА.</p>
+  <form method="get" action="/dashboard">
+    <input type="hidden" name="check" value="1">
+    <button class="btn" type="submit">Провери сега</button>
+  </form>
+  {result_html}
+  <p class="muted" style="margin-top:30px;">Не е финансов съвет - graduated memecoin-ите са изключително
+  волатилни и рискови. Пълните алърти пак идват по email, както досега.</p>
+</body>
+</html>"""
+
+
+@app.route("/dashboard")
+def dashboard():
+    show_result = request.args.get("check") == "1"
+    result_html = _render_best_candidate_html() if show_result else ""
+    return _DASHBOARD_PAGE.format(result_html=result_html)
 
 
 def _safe_float(val) -> float:
@@ -262,6 +379,16 @@ async def monitor_token(mint: str):
                 mint, poll_num, result.score, momentum_pct, drawdown_pct, result.liquidity_usd,
                 "; ".join(result.reasons),
             )
+            # За /dashboard бутона - виж коментара при _latest_scores по-горе.
+            with _latest_scores_lock:
+                _latest_scores[mint] = {
+                    "score": result.score,
+                    "reasons": result.reasons,
+                    "liquidity_usd": result.liquidity_usd,
+                    "market_cap_usd": result.market_cap_usd,
+                    "potential_label": result.potential_label,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
 
             # Защита срещу "купуване на върха" / еднократен spike - виж
             # config.MIN_POLLS_BEFORE_ALERT. РЕАЛЕН БЪГ (17.09, TWOSIDES/
@@ -346,6 +473,18 @@ async def monitor_token(mint: str):
                         # (пратено, или email-ите изключени/грешка - виж
                         # notifier.py::send_alert за пълния списък).
                         _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
+                        # За /dashboard бутона - същата монета/данни като email алърта.
+                        with _recent_alerts_lock:
+                            _recent_alerts.insert(0, {
+                                "mint": mint,
+                                "score": result.score,
+                                "reasons": result.reasons,
+                                "liquidity_usd": result.liquidity_usd,
+                                "market_cap_usd": result.market_cap_usd,
+                                "potential_label": result.potential_label,
+                                "alerted_at": datetime.now(timezone.utc).isoformat(),
+                            })
+                            del _recent_alerts[MAX_RECENT_ALERTS:]
                         break
                     else:
                         log.info(
@@ -375,6 +514,8 @@ async def monitor_token(mint: str):
     finally:
         with _monitoring_lock:
             _monitoring.discard(mint)
+        with _latest_scores_lock:
+            _latest_scores.pop(mint, None)
         mark_seen(mint, _seen)
         _status["seen_count"] = len(_seen)
 
