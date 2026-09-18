@@ -28,7 +28,7 @@ from pumpportal_client import listen_for_migrations
 from data_sources import get_dexscreener_pairs_batch, get_dexscreener_pairs, get_rugcheck_report, extract_mint_address
 from scoring import score_token
 from seen_store import load_seen, mark_seen
-from notifier import send_alert, can_send_now
+from notifier import send_alert, can_send_now, send_watch_digest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,6 +64,8 @@ REQUIRED_CONFIG_ATTRS = [
     "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
     "ALERT_ACTIVE_START_HOUR", "ALERT_ACTIVE_START_MINUTE",
     "ALERT_ACTIVE_END_HOUR", "ALERT_ACTIVE_END_MINUTE",
+    # --- добавено 18.09 вечерта - периодичен "heartbeat" email на всеки 5 мин ---
+    "WATCH_DIGEST_ENABLED",
 ]
 
 
@@ -225,11 +227,27 @@ def _candidate_card_html(mint: str, data: dict, confirmed: bool) -> str:
 
 
 def _render_best_candidate_html() -> str:
+    # ВАЖНО (18.09 вечерта, по оплакване на потребителя - "седи на един" на
+    # /dashboard): преди тук ВИНАГИ показвахме последния потвърден алърт,
+    # завинаги, докато не дойде нов - дори ако е отпреди часове и монетата
+    # вече е паднала/умряла. Сега показваме потвърден алърт само ако е
+    # достатъчно ПРЕСЕН (в рамките на MONITOR_WINDOW_MINUTES - същия
+    # прозорец, в който монетата така или иначе се следи активно) - иначе
+    # падаме към текущата най-добра следена монета, за да страницата реално
+    # се сменя с времето, не залепва за старо.
     with _recent_alerts_lock:
         alerts_snapshot = list(_recent_alerts)
     if alerts_snapshot:
         best = alerts_snapshot[0]
-        return _candidate_card_html(best["mint"], best, confirmed=True)
+        is_fresh = True
+        try:
+            alerted_at = datetime.fromisoformat(best.get("alerted_at", ""))
+            age_minutes = (datetime.now(timezone.utc) - alerted_at).total_seconds() / 60
+            is_fresh = age_minutes <= config.MONITOR_WINDOW_MINUTES
+        except (ValueError, TypeError):
+            pass  # непарсваема дата - по-добре да покажем алърта, отколкото да скрием валиден резултат
+        if is_fresh:
+            return _candidate_card_html(best["mint"], best, confirmed=True)
 
     with _latest_scores_lock:
         scores_snapshot = dict(_latest_scores)
@@ -315,6 +333,40 @@ async def _refresh_market_data_loop():
         except Exception as e:
             log.warning("Грешка в централния market-data refresh loop: %s", e)
         await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
+
+
+async def _watch_digest_loop():
+    """Периодичен 'heartbeat' email на всеки config.MIN_EMAIL_INTERVAL_SECONDS
+    (18.09 вечерта, по изричен избор на потребителя: "изпраща ми имейл на
+    всеки 5 минути за койн", "не да седи на един") - виж коментара в
+    notifier.py::send_watch_digest за пълния контекст. Пуска се НЕЗАВИСИМО
+    от monitor_token()-a, но споделя СЪЩОТО anti-spam темпо (notifier.
+    can_send_now()) - ако вече е пратен истински потвърден алърт наскоро,
+    просто прескача този цикъл, вместо да удвои честотата."""
+    from scoring import MemeScoreResult
+    while True:
+        await asyncio.sleep(config.MIN_EMAIL_INTERVAL_SECONDS)
+        try:
+            if not config.WATCH_DIGEST_ENABLED or not config.ALERT_EMAIL_ENABLED:
+                continue
+            if not can_send_now():
+                continue
+            with _latest_scores_lock:
+                scores_snapshot = dict(_latest_scores)
+            if not scores_snapshot:
+                continue
+            best_mint, best_data = max(scores_snapshot.items(), key=lambda kv: kv[1].get("score", 0))
+            result = MemeScoreResult(
+                mint=best_mint,
+                score=best_data.get("score", 0),
+                reasons=best_data.get("reasons") or [],
+                liquidity_usd=best_data.get("liquidity_usd", 0) or 0,
+                market_cap_usd=best_data.get("market_cap_usd", 0) or 0,
+                potential_label=best_data.get("potential_label", ""),
+            )
+            send_watch_digest(result)
+        except Exception as e:
+            log.warning("Грешка в периодичния watch-digest loop: %s", e)
 
 
 async def monitor_token(mint: str):
@@ -540,6 +592,7 @@ def _run_async_loop():
 
     _status["started_at"] = datetime.now(timezone.utc).isoformat()
     loop.create_task(_refresh_market_data_loop())
+    loop.create_task(_watch_digest_loop())
     loop.run_until_complete(listen_for_migrations(_dispatch))
 
 

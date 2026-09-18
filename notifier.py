@@ -185,6 +185,39 @@ def send_alert(result: MemeScoreResult) -> bool:
     )
 
 
+def send_watch_digest(result: MemeScoreResult) -> bool:
+    """Периодичен 'heartbeat' email на всеки config.MIN_EMAIL_INTERVAL_SECONDS
+    (18.09 вечерта, по изричен избор на потребителя: "изпраща ми имейл на
+    всеки 5 минути за койн", "не да седи на един") - показва НАЙ-ДОБРАТА в
+    момента следена монета, дори да НЕ е минала целия HIGH_POTENTIAL_
+    THRESHOLD/MIN_POLLS_BEFORE_ALERT процес на потвърждение. За разлика от
+    send_alert() (пълен потвърден сигнал), тук ЯСНО пишем в темата и тялото,
+    че е само периодична, непотвърдена информация - за да не се обърка с
+    истински потвърден алърт. Ползва СЪЩИЯ _send_email()/anti-spam темпо
+    като send_alert(), затова не може да удвои честотата отгоре."""
+    message = (
+        "⏳ ПЕРИОДИЧНА МОНЕТА - все още НЕ е напълно потвърдена (score под прага, или чака още "
+        "последователни проверки) - показана само защото е най-добрата в момента следена.\n\n"
+        + format_alert(result)
+    )
+    log.info("MEMECOIN WATCH DIGEST:\n%s", message)
+
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    html = (
+        "<p style='margin:0 0 14px;padding:10px 12px;background:#fff6e5;border-radius:8px;"
+        "color:#a66b00;font-weight:600;'>⏳ Периодична монета - все още НЕ е напълно потвърдена "
+        "(score под прага, или чака още проверки) - само информативно, показана защото в момента "
+        "е най-добрата следена.</p>"
+        + format_alert_html(result)
+    )
+    return _send_email(
+        subject=f"[Memecoin Scanner] (непотвърдено, score {result.score:.0f}) {result.mint[:8]}...",
+        body=message,
+        html=html,
+    )
+
+
 def _send_email(subject: str, body: str, html: str = None) -> bool:
     """Връща True ако е "приключено" (пратен успешно, или причината да не се
     прати НЕ е anti-spam темпото - конфигурация/часове/HTTP грешка, retry
