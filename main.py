@@ -15,9 +15,12 @@ Render-съвместимо: мъничък Flask health-check сървър + ф
 """
 import asyncio
 import logging
+import os
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
+import requests
 from flask import Flask
 
 import config
@@ -52,7 +55,7 @@ REQUIRED_CONFIG_ATTRS = [
     "HIGH_POTENTIAL_THRESHOLD", "FINAL_CHECK_MAX_DRAWDOWN_PCT", "IMPERSONATION_KEYWORDS",
     "IMPERSONATION_LEGITIMACY_WORDS", "ALERT_EMAIL_ENABLED", "RESEND_API_KEY",
     "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO", "MIN_EMAIL_INTERVAL_SECONDS",
-    "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
+    "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT", "KEEP_ALIVE_PING_MINUTES",
 ]
 
 
@@ -370,10 +373,48 @@ def _run_async_loop():
     loop.run_until_complete(listen_for_migrations(_dispatch))
 
 
+def _self_ping_loop():
+    """Праща GET заявка към собствения публичен Render URL на всеки
+    config.KEEP_ALIVE_PING_MINUTES минути.
+
+    ЗАЩО (18.09, по оплакване на потребителя "от час и нещо няма никакви
+    сигнали"): Render безплатният план приспива service-а след 15 мин БЕЗ
+    входящ HTTP трафик (виж README) - докато спи, WebSocket връзката към
+    PumpPortal се къса и се пропускат ВСИЧКИ graduation събития дотогава.
+    Досега единствената защита беше ВЪНШЕН pinger (cron-job.org/UptimeRobot),
+    който трябваше потребителят сам да настрои и поддържа активен - ако не е
+    бил реално пуснат (или е спрял тихо), нищо вътре в бота не забелязва
+    това. Затова сега ботът сам си праща заявка към собствения публичен
+    адрес - Render автоматично слага RENDER_EXTERNAL_URL env variable-а с
+    точно този адрес, затова не се налага да го въвеждаме ръчно.
+
+    Ако RENDER_EXTERNAL_URL липсва (напр. локално стартиране, или хостинг
+    без публичен URL) - просто прескачаме тихо, самопроверката не е
+    приложима. Външният pinger пак е добра ДОПЪЛНИТЕЛНА защита (различен
+    произход на трафика), но вече не е единствената линия."""
+    external_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not external_url:
+        log.info("RENDER_EXTERNAL_URL не е зададен (вероятно локално стартиране) - self-ping е изключен.")
+        return
+    log.info(
+        "Self-ping активен: %s на всеки %d мин (пази Render service-а буден).",
+        external_url, config.KEEP_ALIVE_PING_MINUTES,
+    )
+    while True:
+        time.sleep(config.KEEP_ALIVE_PING_MINUTES * 60)
+        try:
+            requests.get(external_url, timeout=10)
+            log.info("Self-ping към %s - ОК.", external_url)
+        except Exception as e:
+            log.warning("Self-ping към %s се провали: %s (ще пробвам пак след %d мин).", external_url, e, config.KEEP_ALIVE_PING_MINUTES)
+
+
 def main():
     _startup_self_check()
     thread = threading.Thread(target=_run_async_loop, daemon=True)
     thread.start()
+    ping_thread = threading.Thread(target=_self_ping_loop, daemon=True)
+    ping_thread.start()
     app.run(host="0.0.0.0", port=config.PORT)
 
 

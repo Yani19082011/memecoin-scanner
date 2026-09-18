@@ -209,5 +209,12 @@ IMPERSONATION_LEGITIMACY_WORDS = [
 
 PORT = int(os.getenv("PORT", "10000"))
 
+# --- Self-ping (keep-alive) ---
+# Виж коментара в main.py::_self_ping_loop за защо съществува (18.09, по
+# оплакване "от час и нещо няма никакви сигнали" - Render безплатният план
+# приспива service-а след 15 мин без входящ трафик). 5 минути = 3x резерва
+# спрямо 15-те минути праг, вместо да разчитаме само на външен pinger.
+KEEP_ALIVE_PING_MINUTES = int(os.getenv("KEEP_ALIVE_PING_MINUTES", "5"))
+
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 SEEN_FILE = os.path.join(DATA_DIR, "seen.json")
