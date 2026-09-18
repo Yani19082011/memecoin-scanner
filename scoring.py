@@ -301,6 +301,57 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
             raw={"pair": best_pair, "rugcheck": rugcheck_report},
         )
 
+    # Твърд блок при "danger" ниво риск флаг ОТ КАКЪВТО И ДА Е ТИП (не само
+    # Low Liquidity), както и при все още активен mint/freeze authority -
+    # СТРУКТУРЕН ПРОБЛЕМ, намерен при преглед на кода на 18.09 след доклад,
+    # че "всички монети днеска бяха ruggpulnati" въпреки предишните защити:
+    # ликвидност (20т) + обем (20т) + моментум (30т) сами по себе си дават ДО
+    # 70 ТОЧКИ - над HIGH_POTENTIAL_THRESHOLD (65) - т.е. монета с изкуствено
+    # изпомпан обем/моментум можеше да мине прага дори със ЗАПАЗЕН mint
+    # authority, активен freeze authority И множество "danger" риск флага от
+    # RugCheck, защото тези неща досега носеха само точки (общо 30т от 100) -
+    # лесно компенсирани от самия pump. А силен изкуствен pump точно преди
+    # rug pull е класическата схема, не изключение - затова точно тези неща
+    # не бива да могат да се "компенсират" с добри пазарни числа. Сега
+    # спират монетата твърдо, независимо колко силен изглежда pump-ът.
+    if rugcheck_report:
+        risks_list_hard = rugcheck_report.get("risks") or []
+        danger_risk = next(
+            (r for r in risks_list_hard if isinstance(r, dict) and str(r.get("level", "")).lower() == "danger"),
+            None,
+        )
+        if danger_risk:
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=[
+                    f"⚠️ RugCheck флагна '{danger_risk.get('name')}' на ниво 'danger' - твърд блок, "
+                    "независимо от ликвидност/обем/моментум."
+                ],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
+        risk_names_hard = {str(r.get("name", "")).lower() for r in risks_list_hard if isinstance(r, dict)}
+        if any("mint" in n and "authority" in n for n in risk_names_hard):
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=["⚠️ mint authority все още активен - собственикът може да отпечата нови токени по всяко време - твърд блок."],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
+        if any("freeze" in n for n in risk_names_hard):
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=["⚠️ freeze authority все още активен - собственикът може да замрази wallet-и на държатели - твърд блок."],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
+
     reasons = []
     points = 0.0
 
@@ -337,22 +388,23 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         risks = rugcheck_report.get("risks") or []
         risk_names = {str(r.get("name", "")).lower() for r in risks if isinstance(r, dict)}
 
-        if not any("mint" in n and "authority" in n for n in risk_names):
-            points += WEIGHTS["no_mint_authority"]
-            reasons.append("mint authority изглежда revoke-нат")
-        else:
-            reasons.append("⚠️ mint authority все още активен (може да се printne още токени)")
+        # mint authority / freeze authority вече са ТВЪРД БЛОК по-горе - ако
+        # някое от двете беше активно, изобщо нямаше да стигнем дотук.
+        # Точките тук вече са гарантирани - добавяме ги само за прозрачност
+        # в reasons (вижда се в имейла защо score-ът е такъв).
+        points += WEIGHTS["no_mint_authority"]
+        reasons.append("mint authority revoke-нат")
+        points += WEIGHTS["no_freeze_authority"]
+        reasons.append("freeze authority revoke-нат")
 
-        if not any("freeze" in n for n in risk_names):
-            points += WEIGHTS["no_freeze_authority"]
-        else:
-            reasons.append("⚠️ freeze authority активен")
-
-        high_severity = [r for r in risks if isinstance(r, dict) and str(r.get("level", "")).lower() in ("danger", "high")]
+        # "danger" ниво вече е ТВЪРД БЛОК по-горе - тук остава само "high"
+        # ниво (по-леко от danger, но пак си струва да се знае - само отнема
+        # точки, не блокира).
+        high_severity = [r for r in risks if isinstance(r, dict) and str(r.get("level", "")).lower() == "high"]
         if len(high_severity) == 0:
             points += WEIGHTS["low_risk_flags"]
         else:
-            reasons.append(f"⚠️ {len(high_severity)} high-severity риск флага от RugCheck")
+            reasons.append(f"⚠️ {len(high_severity)} 'high'-severity риск флага от RugCheck (под 'danger', не блокира сам по себе си)")
 
         # Само ИНФОРМАТИВНО (не пипа score-а) - под прага MAX_INSIDER_CLUSTERS
         # (виж твърдия блок по-горе за над-прага случая). Сравнителен тест

@@ -266,11 +266,26 @@ async def monitor_token(mint: str):
                         ((peak_price - final_price) / peak_price * 100)
                         if (peak_price and final_price) else drawdown_pct
                     )
+                    # Освен спад в цената, проверяваме и живата ликвидност точно
+                    # преди изпращане (18.09, след преглед на кода - "liquidity
+                    # rug" чрез изтегляне на пула не винаги удря цената веднага
+                    # в СЪЩИЯ момент, но е директен, недвусмислен сигнал сам по
+                    # себе си - ако ликвидността точно СЕГА е под минимума, няма
+                    # смисъл да чакаме драудаун-а да го "настигне").
+                    final_liquidity_usd = (final_best_pair.get("liquidity") or {}).get("usd", 0) or 0
+                    liquidity_collapsed = final_liquidity_usd < config.MIN_LIQUIDITY_USD
                     if final_drawdown_pct >= config.FINAL_CHECK_MAX_DRAWDOWN_PCT:
                         log.info(
                             "%s: финалната проверка точно преди изпращане показа спад %.1f%% от пика "
                             "(над прага %.1f%%) - отменям алърта в последния момент, монетата вече пада.",
                             mint, final_drawdown_pct, config.FINAL_CHECK_MAX_DRAWDOWN_PCT,
+                        )
+                    elif liquidity_collapsed:
+                        log.info(
+                            "%s: финалната проверка точно преди изпращане показа ликвидност $%.0f "
+                            "(под минимума $%.0f) - отменям алърта в последния момент, изглежда като "
+                            "изтегляне на ликвидността в движение.",
+                            mint, final_liquidity_usd, config.MIN_LIQUIDITY_USD,
                         )
                     else:
                         send_alert(result)
