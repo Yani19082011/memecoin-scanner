@@ -43,41 +43,88 @@ class MemeScoreResult:
         return "низък"
 
 
-def _liquidity_points(liquidity_usd: float) -> float:
-    if liquidity_usd >= config.MIN_LIQUIDITY_USD * 4:
+# --- "Sweet spot" точкуване (18.09, нова стратегия по избор на потребителя,
+# за тестване - "дай ми твоя стратегия, ще я тествам") ---
+# ЗАЩО: старото точкуване по-долу беше МОНОТОННО - "колкото повече, толкова
+# по-добре", чак до самия ръб на твърдите блокове (MAX_VOLUME_TO_LIQUIDITY_
+# RATIO, momentum>=80%). Това създаваше извратен стимул: монета точно ПРЕДИ
+# ръба (напр. momentum=75%, обем/ликвидност=14x) получаваше НАЙ-МНОГО точки -
+# същия клас проблем, който вече доведе до реален загубен алърт (FKhooZdA...
+# pump, +98.3% моментум, все още score-нат високо преди да сложим твърдия
+# блок на 80%). Новата логика възнаграждава "здравословния среден диапазон"
+# (органичен, устойчив растеж), не екстремумите точно до ръба на риска -
+# монета точно преди твърд блок вече не получава максимални точки, а
+# намаляващи, защото статистически е по-близо до rug/exhaustion профила.
+# Всички твърди блокове (score_token по-долу) остават НЕПРОМЕНЕНИ - те са
+# изградени от реални rug случаи и не са предмет на този експеримент.
+
+
+def _liquidity_points(liquidity_usd: float, market_cap_usd: float) -> float:
+    """Вместо плосък праг само на абсолютната ликвидност, гледаме
+    СЪОТНОШЕНИЕТО ликвидност/market cap - $30k ликвидност е много по-
+    здравословна при $40k market cap (75% от mc), отколкото при $400k market
+    cap (7.5% от mc), дори числото $30k да е същото. По-дълбока относителна
+    ликвидност = по-трудна за source, по-малък slippage, по-малко вероятно
+    да е "тънка обвивка" около малка реална стойност. Ако market cap е
+    непознат (съвсем нова монета, DexScreener още не го е изчислил), падаме
+    обратно на старата абсолютна логика - нямаме основание за съотношение."""
+    if not market_cap_usd:
+        if liquidity_usd >= config.MIN_LIQUIDITY_USD * 4:
+            return WEIGHTS["liquidity"]
+        if liquidity_usd >= config.MIN_LIQUIDITY_USD * 2:
+            return WEIGHTS["liquidity"] * 0.7
+        if liquidity_usd >= config.MIN_LIQUIDITY_USD:
+            return WEIGHTS["liquidity"] * 0.4
+        return 0
+    ratio = liquidity_usd / market_cap_usd
+    if ratio >= 0.5:
         return WEIGHTS["liquidity"]
-    if liquidity_usd >= config.MIN_LIQUIDITY_USD * 2:
+    if ratio >= 0.3:
         return WEIGHTS["liquidity"] * 0.7
-    if liquidity_usd >= config.MIN_LIQUIDITY_USD:
+    if ratio >= 0.15:
         return WEIGHTS["liquidity"] * 0.4
     return 0
 
 
 def _volume_points(volume_h1: float, liquidity_usd: float) -> float:
+    """Sweet spot вместо монотонно нарастване: съотношение 1x-5x е
+    "здравословен" органичен интерес - над 5x (но все още под твърдия
+    wash-trading блок config.MAX_VOLUME_TO_LIQUIDITY_RATIO) вече започва да
+    прилича на изкуствено надуван обем, дори да не е достатъчно екстремно за
+    твърдия блок, затова точките започват да намаляват, не да продължават
+    да растат."""
     if not liquidity_usd:
         return 0
     ratio = volume_h1 / liquidity_usd
-    if ratio >= 2:
-        return WEIGHTS["volume"]
-    if ratio >= 1:
-        return WEIGHTS["volume"] * 0.6
-    if ratio >= 0.3:
+    if ratio < 0.3:
+        return 0
+    if ratio < 1:
         return WEIGHTS["volume"] * 0.3
-    return 0
+    if ratio <= 5:
+        return WEIGHTS["volume"]
+    if ratio < config.MAX_VOLUME_TO_LIQUIDITY_RATIO:
+        return WEIGHTS["volume"] * 0.4
+    return 0  # практически недостижимо тук - твърдият блок вече би отхвърлил монетата преди score_token да стигне дотук
 
 
 def _momentum_points(momentum_pct: float) -> float:
     """momentum_pct = реално наблюдавана % промяна в цената откакто следим
-    монетата (не DexScreener-ското h1/h24, което за минутна монета е шум)."""
-    if momentum_pct >= 100:
+    монетата (не DexScreener-ското h1/h24, което за минутна монета е шум).
+
+    Sweet spot 15%-60%: достатъчно движение, за да е реален сигнал (не шум),
+    но все още далеч от твърдия блок на 80% (вече изпомпана). Под 15% - все
+    още твърде рано да се различи от случаен шум. Между 60-80% - вече близо
+    до зоната, в която реално се rug-ва/dump-ва (виж твърдия блок по-долу),
+    затова точките намаляват, вместо да продължават да растат както преди."""
+    if momentum_pct < 5:
+        return 0
+    if momentum_pct < 15:
+        return WEIGHTS["momentum"] * 0.35
+    if momentum_pct <= 60:
         return WEIGHTS["momentum"]
-    if momentum_pct >= 50:
-        return WEIGHTS["momentum"] * 0.7
-    if momentum_pct >= 20:
-        return WEIGHTS["momentum"] * 0.4
-    if momentum_pct >= 5:
-        return WEIGHTS["momentum"] * 0.15
-    return 0
+    if momentum_pct < 80:
+        return WEIGHTS["momentum"] * 0.5
+    return 0  # практически недостижимо тук - твърдият momentum>=80% блок вече би отхвърлил монетата преди score_token да стигне дотук
 
 
 def _normalize(text: str) -> str:
@@ -482,7 +529,7 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
     reasons = []
     points = 0.0
 
-    liq_pts = _liquidity_points(liquidity_usd)
+    liq_pts = _liquidity_points(liquidity_usd, market_cap_usd)
     if liq_pts:
         points += liq_pts
         reasons.append(f"ликвидност ${liquidity_usd:,.0f}")
