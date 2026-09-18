@@ -127,11 +127,23 @@ def get_dexscreener_pairs_batch(mint_addresses: list[str]) -> dict[str, list[dic
 
 
 def get_rugcheck_report(mint_address: str) -> dict:
-    """RugCheck риск доклад. Публичен endpoint, без ключ за базов report (виж бележката горе)."""
+    """RugCheck риск доклад. Публичен endpoint, без ключ за базов report (виж бележката горе).
+
+    ВАЖНО (18.09, намерено при преглед на живи Render логове - потребителят
+    докладва "bad request и други глупости" запушващи лога): RugCheck връща
+    HTTP 400 (не 404) за монета, която е реална, но още не е индексирана от
+    техния анализатор - буквално за ВСЯКА прясно graduated монета в първите
+    секунди/минути. Преди тук третирахме само 404 тихо, а 400 падаше в
+    except клона и печаташе WARNING на ВСЕКИ poll за почти всяка следена
+    монета - чист шум в логовете, без реален функционален проблем (score_token
+    вече обработва празен report грациозно - вижда се от "reasons"-а в
+    имейла). Сега и 400, и 404 се третират еднакво тихо ("още няма доклад") -
+    периодичното опресняване (config.RUGCHECK_REFRESH_EVERY_N_POLLS) пак ще
+    хване доклада веднага щом RugCheck реално го индексира."""
     url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report"
     try:
         r = requests.get(url, timeout=10, headers={"Accept": "application/json"})
-        if r.status_code == 404:
+        if r.status_code in (400, 404):
             return {}
         r.raise_for_status()
         report = r.json()
