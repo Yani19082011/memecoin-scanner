@@ -25,7 +25,7 @@ from pumpportal_client import listen_for_migrations
 from data_sources import get_dexscreener_pairs_batch, get_dexscreener_pairs, get_rugcheck_report, extract_mint_address
 from scoring import score_token
 from seen_store import load_seen, mark_seen
-from notifier import send_alert
+from notifier import send_alert, can_send_now
 
 logging.basicConfig(
     level=logging.INFO,
@@ -252,7 +252,24 @@ async def monitor_token(mint: str):
             if result.is_high_potential:
                 already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
                 confirmed = consecutive_high_potential >= config.MIN_POLLS_BEFORE_ALERT
-                if confirmed and not already_rolling_over:
+                if confirmed and not already_rolling_over and config.ALERT_EMAIL_ENABLED and not can_send_now():
+                    # ВАЖНО (18.09, по изричен избор на потребителя): монетата
+                    # Е потвърдена и безопасна точно СЕГА, но anti-spam
+                    # темпото (друг алърт е пратен наскоро - MIN_EMAIL_
+                    # INTERVAL_SECONDS/MAX_EMAILS_PER_DAY) не позволява email
+                    # този момент. НЕ break-ваме и НЕ пращаме стари данни по-
+                    # късно - просто продължаваме да следим монетата (while
+                    # цикълът продължава) и ще пробваме пак на СЛЕДВАЩИЯ poll
+                    # с изцяло ПРЕСНИ данни (нов drawdown/score от кеша, и
+                    # изцяло нова финална live проверка, ако темпото вече е
+                    # освободено тогава) - вместо да губим готова, потвърдена
+                    # монета само защото друг алърт е излязъл секунди по-рано.
+                    log.info(
+                        "%s: score е потвърден (%.1f), НО anti-spam темпото не позволява email точно сега - "
+                        "продължавам да следя и ще пробвам пак на следващия poll с прясна проверка.",
+                        mint, result.score,
+                    )
+                elif confirmed and not already_rolling_over:
                     # Финална live проверка "в последната секунда" - виж
                     # config.FINAL_CHECK_MAX_DRAWDOWN_PCT. Директна свежа
                     # DexScreener заявка (НЕ кеша, който е до
@@ -287,10 +304,24 @@ async def monitor_token(mint: str):
                             "изтегляне на ликвидността в движение.",
                             mint, final_liquidity_usd, config.MIN_LIQUIDITY_USD,
                         )
-                    else:
-                        send_alert(result)
+                    elif send_alert(result):
+                        # send_alert() връща False САМО ако anti-spam темпото
+                        # блокира точно в този момент (виж notifier.py) - тук
+                        # все пак е възможно (рядко) заради race condition:
+                        # друга едновременно следена монета (различен asyncio
+                        # task) да е "изпреварила" и да е използвала темпото
+                        # МЕЖДУ can_send_now() проверката по-горе и реалния
+                        # HTTP send тук. True тук значи наистина обработено
+                        # (пратено, или email-ите изключени/грешка - виж
+                        # notifier.py::send_alert за пълния списък).
                         _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
                         break
+                    else:
+                        log.info(
+                            "%s: anti-spam темпото блокира изпращането точно в последния момент (race с друга "
+                            "монета) - продължавам да следя и ще пробвам пак на следващия poll.",
+                            mint,
+                        )
                 elif already_rolling_over:
                     log.info(
                         "%s: score е висок (%.1f), НО цената вече е паднала %.1f%% от пика - "

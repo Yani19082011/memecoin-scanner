@@ -21,6 +21,25 @@ log = logging.getLogger("notifier")
 
 RESEND_API_URL = "https://api.resend.com/emails"
 
+# --- "Копирай адреса" бутон в имейла ---
+# Email клиентите (Gmail, Outlook и т.н.) блокират JavaScript изцяло, затова
+# НЕ можем да сложим реален "copy to clipboard" бутон директно в самия
+# имейл - такъв бутон просто нямаше да прави нищо при клик. Решение:
+# бутонът е обикновен линк към малка страничка (MintClip), която реално
+# може да ползва JS (браузърът я отваря, не Gmail) - тя чете адреса от URL
+# параметъра и копира с едно докосване. Виж mintclip.html/Artifact-а.
+COPY_PAGE_URL = "https://claude.ai/artifact/BscWewkpEcvcsTdjNeGTs4"
+
+
+def _copy_link(result: MemeScoreResult) -> str:
+    from urllib.parse import urlencode
+    base_token = ((result.raw or {}).get("pair") or {}).get("baseToken") or {}
+    name = base_token.get("name") or base_token.get("symbol") or ""
+    params = {"mint": result.mint}
+    if name:
+        params["name"] = name
+    return f"{COPY_PAGE_URL}?{urlencode(params)}"
+
 
 def _within_active_hours() -> bool:
     """Проверява дали текущият момент е в разрешения прозорец за имейли
@@ -95,27 +114,114 @@ def format_alert(result: MemeScoreResult) -> str:
     return "\n".join(l for l in lines if l is not None)
 
 
-def send_alert(result: MemeScoreResult):
+def format_alert_html(result: MemeScoreResult) -> str:
+    """HTML версия за email-а - плюс "Копирай адреса" бутон (виж COPY_PAGE_URL
+    по-горе за защо е линк към отделна страничка, не истински JS бутон)."""
+    dexscreener_link = f"https://dexscreener.com/solana/{result.mint}"
+    copy_link = _copy_link(result)
+    market_cap_html = f"${result.market_cap_usd:,.0f}" if result.market_cap_usd else "няма данни"
+    potential_html = (
+        f"<p style='margin:0 0 12px;color:#12161f;'><b>Оценка:</b> {result.potential_label}</p>"
+        if result.potential_label else ""
+    )
+    reasons_html = (
+        "<p style='margin:0 0 6px;color:#12161f;'><b>Причини:</b></p>"
+        "<ul style='margin:0 0 16px;padding-left:18px;color:#333;'>"
+        + "".join(f"<li style='margin:0 0 4px;'>{r}</li>" for r in result.reasons)
+        + "</ul>"
+    ) if result.reasons else ""
+
+    return f"""
+    <div style="font-family:-apple-system,'Segoe UI',Roboto,sans-serif;max-width:480px;margin:0 auto;color:#12161f;">
+      <h2 style="margin:0 0 14px;">🚀 Memecoin алърт</h2>
+      <p style="margin:0 0 4px;"><b>Score:</b> {result.score}/100 ({result.estimated_multiplier})</p>
+      <p style="margin:0 0 4px;"><b>Ликвидност:</b> ${result.liquidity_usd:,.0f}</p>
+      <p style="margin:0 0 12px;"><b>Market Cap:</b> {market_cap_html}</p>
+      {potential_html}
+      <p style="margin:0 0 14px;font-family:'SFMono-Regular',Consolas,monospace;font-size:13px;
+                word-break:break-all;background:#f1f3f6;padding:10px 12px;border-radius:8px;color:#12161f;">
+        {result.mint}
+      </p>
+      <p style="text-align:center;margin:20px 0;">
+        <a href="{copy_link}"
+           style="display:inline-block;background:#2ee6a6;color:#04231a;font-weight:700;
+                  text-decoration:none;padding:14px 28px;border-radius:12px;font-size:15px;">
+          📋 Копирай адреса
+        </a>
+      </p>
+      <p style="margin:0 0 16px;text-align:center;">
+        <a href="{dexscreener_link}" style="color:#5b47e0;text-decoration:none;">Виж в DexScreener →</a>
+      </p>
+      {reasons_html}
+      <p style="color:#8a93a6;font-size:12px;margin-top:18px;">
+        Не е финансов съвет - graduated memecoin-ите са изключително волатилни и рискови.
+      </p>
+    </div>
+    """
+
+
+def can_send_now() -> bool:
+    """Pure "peek" (не мърда никакво състояние) - True ако email, пратен точно
+    СЕГА, НЕ би бил пропуснат заради anti-spam темпото
+    (MIN_EMAIL_INTERVAL_SECONDS/MAX_EMAILS_PER_DAY).
+
+    ЗАЩО СЪЩЕСТВУВА (18.09, по изричен избор на потребителя): main.py я
+    ползва, за да прецени ПРЕДИ да похарчи финалната live проверка, дали
+    изобщо си струва - ако темпото не позволява, main.py::monitor_token НЕ
+    спира да следи монетата (не праща стари данни по-късно), а просто чака
+    следващия poll и проверява пак с ПРЕСНИ данни, докато или темпото се
+    освободи, или monitoring прозорецът (MONITOR_WINDOW_MINUTES) изтече.
+    Преди тази промяна: ако две добри монети се потвърдяха в рамките на
+    същия ~5-мин anti-spam прозорец, втората се губеше напълно (само лог,
+    без email) - потребителят изрично поиска да не се случва това."""
+    return _rate_limit_ok()
+
+
+def send_alert(result: MemeScoreResult) -> bool:
+    """Връща True ако е "обработено" (email пратен успешно, ИЛИ email-ите са
+    изключени/не са конфигурирани, ИЛИ извън разрешените часове - в тези
+    случаи чакане не помага, няма смисъл от retry), False САМО когато е
+    пропуснат чисто заради anti-spam темпото - виж can_send_now() по-горе за
+    защо тази разлика има значение за main.py::monitor_token."""
     message = format_alert(result)
     log.info("MEMECOIN ALERT:\n%s", message)
 
-    if config.ALERT_EMAIL_ENABLED:
-        _send_email(subject=f"[Memecoin Scanner] {result.mint[:8]}... - {result.estimated_multiplier}", body=message)
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    return _send_email(
+        subject=f"[Memecoin Scanner] {result.mint[:8]}... - {result.estimated_multiplier}",
+        body=message,
+        html=format_alert_html(result),
+    )
 
 
-def _send_email(subject: str, body: str):
+def _send_email(subject: str, body: str, html: str = None) -> bool:
+    """Връща True ако е "приключено" (пратен успешно, или причината да не се
+    прати НЕ е anti-spam темпото - конфигурация/часове/HTTP грешка, retry
+    не би помогнал), False САМО ако е пропуснат чисто заради темпото (виж
+    can_send_now()/send_alert() по-горе)."""
     if not (config.RESEND_API_KEY and config.ALERT_EMAIL_TO):
         log.warning("Email алъртите са включени, но RESEND_API_KEY/ALERT_EMAIL_TO не са попълнени.")
-        return
+        return True
     if not _within_active_hours():
         log.info(
             "Извън разрешените часове за имейли (%02d:%02d-%02d:%02d %s) - пропускам email-а (алъртът е в логовете).",
             config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
             config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ,
         )
-        return
+        return True
     if not _rate_limit_ok():
-        return
+        return False
+    payload = {
+        "from": config.RESEND_FROM_EMAIL,
+        "to": [config.ALERT_EMAIL_TO],
+        "subject": subject,
+        "text": body,
+    }
+    if html:
+        # Resend показва html, ако е налично - text си остава fallback за
+        # клиенти, които не го рендират. Виж format_alert_html() за бутона.
+        payload["html"] = html
     try:
         resp = requests.post(
             RESEND_API_URL,
@@ -123,18 +229,15 @@ def _send_email(subject: str, body: str):
                 "Authorization": f"Bearer {config.RESEND_API_KEY}",
                 "Content-Type": "application/json",
             },
-            json={
-                "from": config.RESEND_FROM_EMAIL,
-                "to": [config.ALERT_EMAIL_TO],
-                "subject": subject,
-                "text": body,
-            },
+            json=payload,
             timeout=15,
         )
         if resp.status_code >= 300:
             log.error("Resend отказа изпращането (%s): %s", resp.status_code, resp.text)
-        else:
-            _mark_email_sent()
-            log.info("Email алърт изпратен до %s през Resend", config.ALERT_EMAIL_TO)
+            return True  # HTTP грешка, не anti-spam темпо - retry тук не би помогнал по същия начин
+        _mark_email_sent()
+        log.info("Email алърт изпратен до %s през Resend", config.ALERT_EMAIL_TO)
+        return True
     except Exception as e:
         log.error("Изпращането на email през Resend се провали: %s", e)
+        return True  # мрежова грешка, не anti-spam темпо - вече е логнато, не искаме безкраен retry цикъл
