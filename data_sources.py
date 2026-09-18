@@ -14,8 +14,6 @@ import time
 
 import requests
 
-import config
-
 log = logging.getLogger("data_sources")
 
 # Retry при 429 от DexScreener - живи Render логове (17.09) показаха, че

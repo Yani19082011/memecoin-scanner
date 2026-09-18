@@ -117,6 +117,13 @@ def classify_potential(market_cap_usd: float, momentum_pct: float, volume_h1: fl
     very_comfortable_liquidity = liquidity_usd >= config.MIN_LIQUIDITY_USD * 3
 
     # --- Твърдо НЕ - силен риск сигнал, независимо от останалото ---
+    # ЗАБЕЛЕЖКА (18.09, намерено при цялостен преглед на кода): момент с
+    # momentum_pct>=80 вече никога не стига дотук - score_token() по-горе
+    # твърдо блокира (score=0, без изобщо да вика classify_potential) на
+    # точно същия праг, преди тази функция изобщо да се извика. Клонът
+    # остава като защита "на всеки случай" (напр. ако някой друг код път
+    # извика classify_potential() директно, без да мине през score_token),
+    # без реален разход - но реално мъртъв код при нормалния поток.
     if momentum_pct >= 80:
         return "⚠️ Long runner: НЕ - вече силно изпомпана, влизаш късно с повишен риск точно сега да е dump"
     if not comfortable_liquidity:
@@ -140,6 +147,23 @@ def classify_potential(market_cap_usd: float, momentum_pct: float, volume_h1: fl
         return "🌱 Long runner: ПО-СКОРО ДА - все още малка по market cap, ликвидността е необичайно дълбока за размера ѝ"
     if is_still_small:
         return "🌱 Long runner: ПО-СКОРО НЕ - все още малка по market cap, но профилът (моментум/обем) не е особено убедителен"
+
+    # --- "Разширена зона" (150k - EXTENDED_MAX_MARKET_CAP_USD, по подразбиране
+    # 500k) - ВАЖНО (18.09, реален случай: TIGRINO, 91ryaC...Lgpump - влязохме
+    # на $170.5K MC, продадохме на $220.1K MC за +29%, но монетата продължи
+    # ДО $1.5M MC (+52,081% от старта) - продадохме твърде рано, защото ниkъде
+    # не пишеше "Long runner: ДА" на този mc диапазон, старата функция тук
+    # връщаше директно "НЕ" над 150k. Ако монетата стигне дотук (score_token
+    # вече изисква чист RugCheck доклад + дълбока ликвидност за да мине
+    # изобщо score-ването отвъд 110k - виж config.EXTENDED_MAX_MARKET_CAP_USD),
+    # значи вече е доказала, че не е бърз pump-and-dump - затова etikетираме
+    # като потенциален траен растеж, не "изразходван моментум".
+    if bool(market_cap_usd) and market_cap_usd <= config.EXTENDED_MAX_MARKET_CAP_USD:
+        return (
+            "🔥 Long runner: ДА (по-рядко, но виж TIGRINO 18.09) - над обичайния 'ранен' диапазон, но мина "
+            "по-строгите проверки за 'разширена зона' (чист RugCheck доклад, дълбока ликвидност) - изглежда "
+            "като траен растеж, не бърз pump-and-dump. Не продавай автоматично само защото mc вече не е малък."
+        )
     return "➖ Long runner: НЕ - вече не е 'ранно' влизане, моментумът изглежда до голяма степен изразходван"
 
 
@@ -175,6 +199,7 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
 
     liquidity_usd = (best_pair.get("liquidity") or {}).get("usd", 0) or 0
     market_cap_usd = best_pair.get("marketCap") or best_pair.get("fdv") or 0
+    volume_h1 = (best_pair.get("volume") or {}).get("h1", 0) or 0
 
     base_token = best_pair.get("baseToken") or {}
     token_name = base_token.get("name", "")
@@ -212,17 +237,100 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
             raw={"pair": best_pair, "rugcheck": rugcheck_report},
         )
 
+    # Твърд блок при съмнително високо съотношение обем(1ч)/ликвидност - виж
+    # config.MAX_VOLUME_TO_LIQUIDITY_RATIO за реалния случай (18.09,
+    # 6jUqDqQid...pump - ~57x точно преди rug pull). Такова съотношение почти
+    # никога не е органично - или wash trading (изкуствено надуван обем, за
+    # да изглежда монетата "гореща"), или изключително тънка ликвидност,
+    # която дори малка продажба може да срине рязко. И двете са rug сигнали,
+    # независимо от другите фактори.
+    volume_to_liquidity_ratio = (volume_h1 / liquidity_usd) if liquidity_usd else 0
+    if volume_to_liquidity_ratio > config.MAX_VOLUME_TO_LIQUIDITY_RATIO:
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[
+                f"⚠️ съотношение обем(1ч)/ликвидност твърде високо ({volume_to_liquidity_ratio:.1f}x - "
+                f"${volume_h1:,.0f} обем срещу ${liquidity_usd:,.0f} ликвидност) - над прага "
+                f"{config.MAX_VOLUME_TO_LIQUIDITY_RATIO:.0f}x, вероятно wash trading, пропускам."
+            ],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
+
     # Горен таван на market cap - целта е да хващаме монети РАНО, докато са
     # все още малки, не след като вече са набъбнали значително. market_cap_usd
     # може да е 0/непознат за съвсем нови монети (DexScreener още не го е
     # изчислил) - в такъв случай НЕ филтрираме тук (нямаме основание да
     # отхвърлим заради непозната стойност), но филтрираме твърдо, ако имаме
     # реална стойност над прага.
-    if market_cap_usd and market_cap_usd > config.MAX_MARKET_CAP_USD:
+    if market_cap_usd and market_cap_usd > config.EXTENDED_MAX_MARKET_CAP_USD:
         return MemeScoreResult(
             mint=mint,
             score=0,
-            reasons=[f"market cap твърде висок (${market_cap_usd:,.0f}) - над лимита ${config.MAX_MARKET_CAP_USD:,.0f}, вече не е 'ранно' влизане"],
+            reasons=[
+                f"market cap твърде висок (${market_cap_usd:,.0f}) - над твърдия таван "
+                f"${config.EXTENDED_MAX_MARKET_CAP_USD:,.0f}, никога не продължаваме да следим над това."
+            ],
+            liquidity_usd=liquidity_usd,
+            market_cap_usd=market_cap_usd,
+            raw={"pair": best_pair, "rugcheck": rugcheck_report},
+        )
+
+    if market_cap_usd and market_cap_usd > config.MAX_MARKET_CAP_USD:
+        # "Разширена зона" (config.MAX_MARKET_CAP_USD до EXTENDED_MAX_MARKET_CAP_USD,
+        # по подразбиране 110k-500k) - ВАЖНО (18.09, по изричен избор на
+        # потребителя: "ако е свързано с нещо тренд ново... long runner
+        # примерно от 30k mc до 500k mc"). Нямаме надежден начин да познаем
+        # автоматично "нов тренд" по тема/име, затова вместо да гадаем,
+        # изискваме монетата да е АБСОЛЮТНО чиста по обективни признаци, за
+        # да продължи да се следи отвъд обичайния 110k праг:
+        #   - RugCheck доклад НАЛИЧЕН и с НУЛА риск флага (не просто под
+        #     'danger'/'high' - буквално чист доклад)
+        #   - ликвидност над EXTENDED_ZONE_MIN_LIQUIDITY_USD (по-висок под от
+        #     нормалния - по-голям market cap изисква пропорционално по-
+        #     дълбока ликвидност, иначе е точно профилът на wash trading)
+        # Волюм/ликвидност съотношението вече е проверено твърдо по-горе
+        # (важи за всички market cap-ове, не само тук).
+        # Ако дори едно от тези не е изпълнено - отхвърля се на обичайния
+        # 110k таван, както преди тази промяна.
+        rugcheck_clean = bool(rugcheck_report) and not (rugcheck_report.get("risks") or [])
+        liquidity_deep_enough = liquidity_usd >= config.EXTENDED_ZONE_MIN_LIQUIDITY_USD
+        if not (rugcheck_clean and liquidity_deep_enough):
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=[
+                    f"market cap ${market_cap_usd:,.0f} е над обичайния 'ранен' таван ${config.MAX_MARKET_CAP_USD:,.0f}, "
+                    f"и не минава по-строгите изисквания за 'разширена зона' (чист RugCheck доклад: "
+                    f"{'да' if rugcheck_clean else 'НЕ'}, ликвидност ≥${config.EXTENDED_ZONE_MIN_LIQUIDITY_USD:,.0f}: "
+                    f"{'да' if liquidity_deep_enough else 'НЕ'}) - пропускам."
+                ],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
+
+    # Твърд блок при вече прекалено висок моментум - ВАЖНО (18.09, реален
+    # случай: FKhooZdA...pump, score 79, market cap $104,981, momentum
+    # +98.3% - алъртът излезе с текстово предупреждение "⚠️ Long runner: НЕ -
+    # вече силно изпомпана", но самият score ВСЕ ПАК го пресметна достатъчно
+    # високо, за да мине прага, защото _momentum_points() дава НАЙ-МНОГО точки
+    # точно на момента >=100% - т.е. архитектурно противоречие: класификацията
+    # казваше "рисково", докато score-ът го възнаграждаваше. Потребителят
+    # последва алърта и загуби пари. Прагът 80% съвпада с този в
+    # classify_potential() по-долу - монета толкова изпомпана вече е по-скоро
+    # на път да dump-не, отколкото да продължи нагоре, затова вече изобщо НЕ
+    # пращаме email за нея, вместо просто да предупредим в текста.
+    if momentum_pct >= 80:
+        return MemeScoreResult(
+            mint=mint,
+            score=0,
+            reasons=[
+                f"моментум твърде висок (+{momentum_pct:.0f}%) - монетата вероятно вече е силно изпомпана и по-скоро "
+                "на път да dump-не, отколкото да продължи нагоре - пропускам, независимо от другите фактори"
+            ],
             liquidity_usd=liquidity_usd,
             market_cap_usd=market_cap_usd,
             raw={"pair": best_pair, "rugcheck": rugcheck_report},
@@ -351,11 +459,28 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
                 market_cap_usd=market_cap_usd,
                 raw={"pair": best_pair, "rugcheck": rugcheck_report},
             )
+        # Твърд блок при "market cap per holder" риск ОТ КАКЪВТО И ДА Е level -
+        # ВАЖНО (18.09, реален случай: 6jUqDqQid...pump, RugCheck флагна точно
+        # това на ниво 'warn' - под 'danger', значи не спираше преди - и
+        # монетата рухна). Концентрирано разпределение (малко хора държат
+        # непропорционално голяма част от market cap-а спрямо броя държатели)
+        # е структурен риск сам по себе си - шепа wallet-и могат да съборят
+        # цената - независимо какво ниво на severity му е дало RugCheck.
+        if any("market cap" in n and "holder" in n for n in risk_names_hard):
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=[
+                    "⚠️ RugCheck флагна 'high market cap per holder' - концентрирано разпределение, "
+                    "шепа wallet-и могат да съборят цената - твърд блок, независимо от level."
+                ],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
 
     reasons = []
     points = 0.0
-
-    volume_h1 = (best_pair.get("volume") or {}).get("h1", 0) or 0
 
     liq_pts = _liquidity_points(liquidity_usd)
     if liq_pts:

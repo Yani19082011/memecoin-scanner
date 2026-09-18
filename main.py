@@ -56,6 +56,14 @@ REQUIRED_CONFIG_ATTRS = [
     "IMPERSONATION_LEGITIMACY_WORDS", "ALERT_EMAIL_ENABLED", "RESEND_API_KEY",
     "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO", "MIN_EMAIL_INTERVAL_SECONDS",
     "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT", "KEEP_ALIVE_PING_MINUTES",
+    # --- добавени 18.09 при цялостен преглед на кода - тези липсваха от
+    # проверката, въпреки че се четат реално от бота (main.py при модулно
+    # ниво/load_seen, scoring.py за "разширената зона"/wash-trading защитите) ---
+    "EXTENDED_MAX_MARKET_CAP_USD", "EXTENDED_ZONE_MIN_LIQUIDITY_USD",
+    "MAX_VOLUME_TO_LIQUIDITY_RATIO", "DATA_DIR", "SEEN_FILE",
+    "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
+    "ALERT_ACTIVE_START_HOUR", "ALERT_ACTIVE_START_MINUTE",
+    "ALERT_ACTIVE_END_HOUR", "ALERT_ACTIVE_END_MINUTE",
 ]
 
 
@@ -93,6 +101,15 @@ def _startup_self_check():
     log.info("Стартова самопроверка: config.py и scoring.py изглеждат съвместими.")
 
 
+# ВАЖНО (18.09, намерено при цялостен преглед на кода): _startup_self_check()
+# трябва да се извика ТУК, ПРЕДИ load_seen() по-долу - иначе load_seen() (чете
+# config.DATA_DIR/SEEN_FILE/UPSTASH_REDIS_REST_URL/TOKEN) може да гръмне с
+# гол, неясен AttributeError при стар/непълен config.py, преди самата
+# самопроверка изобщо да успее да покаже ясната CRITICAL диагностика по-горе.
+# main() по-долу вече НЕ вика проверката пак - извикана е веднъж, тук, при
+# импортиране на модула.
+_startup_self_check()
+
 app = Flask(__name__)
 _status = {
     "started_at": None,
@@ -103,6 +120,13 @@ _status = {
 }
 _seen = load_seen()
 _monitoring = set()
+# Заключва достъпа до _monitoring - мутира се от asyncio нишката
+# (monitor_token добавя/маха mint-ове), а се ЧЕТЕ както от Flask нишката
+# (health() route по-долу), така и от _refresh_market_data_loop - без
+# заключване, list(_monitoring) точно докато друга нишка прави add()/
+# discard() може да гръмне с "RuntimeError: Set changed size during
+# iteration" (намерено при цялостен преглед на кода, 18.09).
+_monitoring_lock = threading.Lock()
 
 # Споделен кеш с последните DexScreener данни за всяка следена монета -
 # пълни се от ЕДИН централен loop (_refresh_market_data_loop), който прави
@@ -116,7 +140,8 @@ _market_data_cache: dict = {}
 
 @app.route("/")
 def health():
-    _status["currently_monitoring"] = list(_monitoring)
+    with _monitoring_lock:
+        _status["currently_monitoring"] = list(_monitoring)
     return {"status": "ok", **_status}
 
 
@@ -158,15 +183,17 @@ async def _refresh_market_data_loop():
     жив - виж коментара при _market_data_cache по-горе за причината."""
     while True:
         try:
-            mints = list(_monitoring)
+            with _monitoring_lock:
+                mints = list(_monitoring)
             if mints:
                 fresh = await asyncio.to_thread(get_dexscreener_pairs_batch, mints)
                 _market_data_cache.update(fresh)
                 # чистим кеша от монети, които вече не следим (излезли от
                 # monitor_token поради timeout/алърт/грешка) - да не расте
                 # неограничено през дни наред работа на процеса.
+                mints_set = set(mints)
                 for stale_mint in list(_market_data_cache.keys()):
-                    if stale_mint not in _monitoring:
+                    if stale_mint not in mints_set:
                         _market_data_cache.pop(stale_mint, None)
         except Exception as e:
             log.warning("Грешка в централния market-data refresh loop: %s", e)
@@ -176,7 +203,8 @@ async def _refresh_market_data_loop():
 async def monitor_token(mint: str):
     """Следи монетата на живо и праща алърт веднага щом пресече прага -
     вместо да чака фиксирано изчакване и да провери само веднъж."""
-    _monitoring.add(mint)
+    with _monitoring_lock:
+        _monitoring.add(mint)
     try:
         await asyncio.sleep(config.INITIAL_INDEX_DELAY_SECONDS)
 
@@ -345,7 +373,8 @@ async def monitor_token(mint: str):
     except Exception as e:
         log.warning("Грешка при следене на %s: %s", mint, e)
     finally:
-        _monitoring.discard(mint)
+        with _monitoring_lock:
+            _monitoring.discard(mint)
         mark_seen(mint, _seen)
         _status["seen_count"] = len(_seen)
 
@@ -410,7 +439,8 @@ def _self_ping_loop():
 
 
 def main():
-    _startup_self_check()
+    # _startup_self_check() вече е извикана веднъж при импортиране на модула
+    # (виж по-горе, ПРЕДИ load_seen()) - не се налага втори път тук.
     thread = threading.Thread(target=_run_async_loop, daemon=True)
     thread.start()
     ping_thread = threading.Thread(target=_self_ping_loop, daemon=True)
