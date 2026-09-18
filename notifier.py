@@ -21,24 +21,18 @@ log = logging.getLogger("notifier")
 
 RESEND_API_URL = "https://api.resend.com/emails"
 
-# --- "Копирай адреса" бутон в имейла ---
-# Email клиентите (Gmail, Outlook и т.н.) блокират JavaScript изцяло, затова
-# НЕ можем да сложим реален "copy to clipboard" бутон директно в самия
-# имейл - такъв бутон просто нямаше да прави нищо при клик. Решение:
-# бутонът е обикновен линк към малка страничка (MintClip), която реално
-# може да ползва JS (браузърът я отваря, не Gmail) - тя чете адреса от URL
-# параметъра и копира с едно докосване. Виж mintclip.html/Artifact-а.
-COPY_PAGE_URL = "https://claude.ai/artifact/BscWewkpEcvcsTdjNeGTs4"
-
-
-def _copy_link(result: MemeScoreResult) -> str:
-    from urllib.parse import urlencode
-    base_token = ((result.raw or {}).get("pair") or {}).get("baseToken") or {}
-    name = base_token.get("name") or base_token.get("symbol") or ""
-    params = {"mint": result.mint}
-    if name:
-        params["name"] = name
-    return f"{COPY_PAGE_URL}?{urlencode(params)}"
+# --- "Копирай адреса" ---
+# ВАЖНО (18.09): преди тук имаше бутон-линк към отделна MintClip страничка
+# (Claude Artifact), която да чете адреса от URL параметър и да копира с
+# едно докосване - идеята беше "email клиентите блокират JS, затова води
+# към страница, която МОЖЕ да го направи". Оказа се, че Claude Artifact
+# страниците се render-ват в sandbox iframe, който НЕ получава URL
+# параметрите на външния линк изобщо (потвърдено с реален тест в браузър) -
+# страницата винаги показваше "няма адрес", независимо какво е в линка.
+# Това е ограничение на самата платформа, не поправим откъм HTML/JS код тук.
+# Решение вместо това: адресът вече стои в имейла като ясно откроен,
+# избираем текст - на телефон, задържане с пръст върху него показва системно
+# "Copy" меню автоматично, без нужда от външна страница или бутон.
 
 
 def _within_active_hours() -> bool:
@@ -115,10 +109,11 @@ def format_alert(result: MemeScoreResult) -> str:
 
 
 def format_alert_html(result: MemeScoreResult) -> str:
-    """HTML версия за email-а - плюс "Копирай адреса" бутон (виж COPY_PAGE_URL
-    по-горе за защо е линк към отделна страничка, не истински JS бутон)."""
+    """HTML версия за email-а. Адресът е показан като ясно откроен, избираем
+    текстов блок (виж коментара горе за "Копирай адреса" - защо няма линк/
+    бутон към отделна страница) - на телефон, задържане с пръст върху него
+    показва системно "Copy" меню автоматично."""
     dexscreener_link = f"https://dexscreener.com/solana/{result.mint}"
-    copy_link = _copy_link(result)
     market_cap_html = f"${result.market_cap_usd:,.0f}" if result.market_cap_usd else "няма данни"
     potential_html = (
         f"<p style='margin:0 0 12px;color:#12161f;'><b>Оценка:</b> {result.potential_label}</p>"
@@ -138,16 +133,11 @@ def format_alert_html(result: MemeScoreResult) -> str:
       <p style="margin:0 0 4px;"><b>Ликвидност:</b> ${result.liquidity_usd:,.0f}</p>
       <p style="margin:0 0 12px;"><b>Market Cap:</b> {market_cap_html}</p>
       {potential_html}
-      <p style="margin:0 0 14px;font-family:'SFMono-Regular',Consolas,monospace;font-size:13px;
-                word-break:break-all;background:#f1f3f6;padding:10px 12px;border-radius:8px;color:#12161f;">
+      <p style="margin:0 0 6px;color:#666f80;font-size:12px;">📋 Адрес на монетата - кликни/задръж върху него, после Ctrl+C (компютър) или "Copy" от менюто (телефон):</p>
+      <p style="margin:0 0 16px;font-family:'SFMono-Regular',Consolas,monospace;font-size:14px;
+                word-break:break-all;background:#f1f3f6;padding:14px 12px;border-radius:8px;color:#12161f;
+                border:1px solid #dde1e8;user-select:all;-webkit-user-select:all;">
         {result.mint}
-      </p>
-      <p style="text-align:center;margin:20px 0;">
-        <a href="{copy_link}"
-           style="display:inline-block;background:#2ee6a6;color:#04231a;font-weight:700;
-                  text-decoration:none;padding:14px 28px;border-radius:12px;font-size:15px;">
-          📋 Копирай адреса
-        </a>
       </p>
       <p style="margin:0 0 16px;text-align:center;">
         <a href="{dexscreener_link}" style="color:#5b47e0;text-decoration:none;">Виж в DexScreener →</a>
