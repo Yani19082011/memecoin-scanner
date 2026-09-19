@@ -28,15 +28,6 @@ async def listen_for_migrations(on_migration):
                         event = json.loads(raw_message)
                     except json.JSONDecodeError:
                         continue
-                    if isinstance(event, dict) and set(event.keys()) == {"message"}:
-                        # PumpPortal-ското potvarждение за самия subscribe
-                        # ("Subscribed to 'migration' events.") - НЕ е реално
-                        # migration събитие, просто ACK на заявката ни отгоре.
-                        # Преди го подавахме на on_migration() и той логваше
-                        # объркващо "не разпознах mint адрес" за него - сега
-                        # го разпознаваме тук и просто го логваме отделно.
-                        log.info("PumpPortal потвърждение: %s", event.get("message"))
-                        continue
                     log.info("RAW migration payload: %s", event)
                     await on_migration(event)
         except Exception as e:
