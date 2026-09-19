@@ -51,6 +51,29 @@ def health():
     return {"status": "ok", **_status}
 
 
+@app.route("/test-email")
+def test_email():
+    """Изпраща тестов email алърт през Resend, за да провериш дали
+    ALERT_EMAIL_ENABLED/RESEND_API_KEY/ALERT_EMAIL_TO са настроени правилно.
+    Просто отвори този URL в браузъра веднъж."""
+    from scoring import MemeScoreResult
+    fake = MemeScoreResult(
+        mint="TestMint1111111111111111111111111111111111",
+        score=99,
+        reasons=["Това е тестов алърт за проверка на Resend интеграцията."],
+        liquidity_usd=12345,
+        market_cap_usd=45000,
+        potential_label="🚀 Потенциален голям runner (нисък market cap + силен ранен моментум + висок обем) - но силно спекулативно, повечето такива монети пак отиват на 0",
+        raw={},
+    )
+    send_alert(fake)
+    if not config.ALERT_EMAIL_ENABLED:
+        return {"sent": False, "reason": "ALERT_EMAIL_ENABLED е false - провери Render Environment Variables."}
+    if not config.RESEND_API_KEY:
+        return {"sent": False, "reason": "RESEND_API_KEY липсва - провери Render Environment Variables."}
+    return {"sent": True, "to": config.ALERT_EMAIL_TO, "note": "Провери логовете (Logs таб) и пощата си."}
+
+
 def _safe_float(val) -> float:
     try:
         return float(val)
@@ -65,35 +88,63 @@ async def monitor_token(mint: str):
     try:
         await asyncio.sleep(config.INITIAL_INDEX_DELAY_SECONDS)
 
-        # RugCheck се дърпа веднъж в началото - mint/freeze/risk флаговете не
-        # се менят на всяка минута, няма смисъл да го питаме на всеки poll.
+        # RugCheck: опитваме пак на всеки poll, ДОКАТО не получим реален
+        # доклад - веднага след graduation монетата често още не е
+        # индексирана (празен report), а преди кодът приемаше "няма флагове"
+        # (защото няма доклад изобщо) като "монетата е чиста" и я score-ваше
+        # високо въпреки нулева реална риск-проверка. Затова продължаваме да
+        # питаме, докато RugCheck реално я индексира; веднъж получен доклад,
+        # спираме да питаме отново (флаговете не се менят всяка минута).
         rugcheck_report = get_rugcheck_report(mint)
 
         first_price = None
+        peak_price = None
         deadline = datetime.now(timezone.utc) + timedelta(minutes=config.MONITOR_WINDOW_MINUTES)
         poll_num = 0
 
         while datetime.now(timezone.utc) < deadline:
             poll_num += 1
+            if not rugcheck_report:
+                rugcheck_report = get_rugcheck_report(mint)
             pairs = get_dexscreener_pairs(mint)
             best_pair = pairs[0] if pairs else {}
             price = _safe_float(best_pair.get("priceUsd"))
 
             if first_price is None and price:
                 first_price = price
+            if price:
+                peak_price = max(peak_price, price) if peak_price else price
             momentum_pct = ((price - first_price) / first_price * 100) if (first_price and price) else 0.0
+            drawdown_pct = ((peak_price - price) / peak_price * 100) if (peak_price and price) else 0.0
 
             result = score_token(mint, best_pair, rugcheck_report, momentum_pct)
             log.info(
-                "[%s] poll #%d score=%.1f моментум=%.1f%% ликвидност=$%.0f (%s)",
-                mint, poll_num, result.score, momentum_pct, result.liquidity_usd,
+                "[%s] poll #%d score=%.1f моментум=%.1f%% спад_от_пика=%.1f%% ликвидност=$%.0f (%s)",
+                mint, poll_num, result.score, momentum_pct, drawdown_pct, result.liquidity_usd,
                 "; ".join(result.reasons),
             )
 
             if result.is_high_potential:
-                send_alert(result)
-                _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
-                break
+                # Защита срещу "купуване на върха" - виж коментара при
+                # MIN_POLLS_BEFORE_ALERT/PEAK_DRAWDOWN_STOP_PCT в config.py.
+                already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
+                confirmed = poll_num >= config.MIN_POLLS_BEFORE_ALERT
+                if confirmed and not already_rolling_over:
+                    send_alert(result)
+                    _status["last_alert_at"] = datetime.now(timezone.utc).isoformat()
+                    break
+                elif already_rolling_over:
+                    log.info(
+                        "%s: score е висок (%.1f), НО цената вече е паднала %.1f%% от пика - "
+                        "най-вероятно върхът е изпуснат, пропускам алърта.",
+                        mint, result.score, drawdown_pct,
+                    )
+                else:
+                    log.info(
+                        "%s: score е висок (%.1f) на poll #%d, чакам поне %d последователни "
+                        "проверки над прага преди да пратя алърт.",
+                        mint, result.score, poll_num, config.MIN_POLLS_BEFORE_ALERT,
+                    )
 
             await asyncio.sleep(config.POLL_INTERVAL_SECONDS)
         else:
