@@ -19,7 +19,9 @@ class UltimateMemecoinBot:
         # НАСТРОЙКИ ЗА ИМЕЙЛ ИЗВЕСТИЯ (Gmail SMTP)
         self.smtp_server = "smtp.gmail.com"
         self.smtp_port = 587
-        self.receiver_email = "yani.kolev2011@gmail.com"
+        
+        # СПИСЪК С ПОЛУЧАТЕЛИ НА ИМЕЙЛ ИЗВЕСТИЯТА
+        self.receiver_emails = ["yani.kolev2011@gmail.com", "crafts0man0@gmail.com"]
         
         # ВАЖНО: За да изпращате имейли, въведете вашия изпращащ Gmail и неговата "Парола за приложение" (App Password)
         self.sender_email = os.getenv("SENDER_EMAIL", "YOUR_EMAIL@gmail.com")
@@ -130,30 +132,34 @@ class UltimateMemecoinBot:
 
     def send_email_notification(self, subject: str, body: str):
         """
-        ИЗВЕСТИЯ ПО ИМЕЙЛ: Изпраща подробно писмо при намерен сигурен токен в реално време.
+        ИЗВЕСТИЯ ПО ИМЕЙЛ: Изпраща подробно писмо при намерен сигурен токен в реално време до всички получатели.
         """
         if self.sender_email == "YOUR_EMAIL@gmail.com" or self.sender_password == "YOUR_GMAIL_APP_PASSWORD":
-            logging.warning("Имейлът не е изпратен! Моля, конфигурирайте реални sender_email и sender_password в __init__.")
+            logging.warning("Имейлът не е изпратен! Моля, конфигурирайте реални sender_email и sender_password in __init__.")
             return
 
         try:
-            msg = MIMEMultipart()
-            msg['From'] = self.sender_email
-            msg['To'] = self.receiver_email
-            msg['Subject'] = subject
-
-            msg.attach(MIMEText(body, 'plain'))
-
-            # Свързване със SMTP сървъра на Gmail
+            # Свързване със SMTP сървъра на Gmail веднъж за цялата сесия на изпращане
             server = smtplib.SMTP(self.smtp_server, self.smtp_port)
             server.starttls()  # Активиране на TLS криптиране за сигурност
             server.login(self.sender_email, self.sender_password)
-            server.sendmail(self.sender_email, self.receiver_email, msg.as_string())
+
+            for receiver in self.receiver_emails:
+                try:
+                    msg = MIMEMultipart()
+                    msg['From'] = self.sender_email
+                    msg['To'] = receiver
+                    msg['Subject'] = subject
+                    msg.attach(MIMEText(body, 'plain'))
+
+                    server.sendmail(self.sender_email, receiver, msg.as_string())
+                    logging.info(f"📧 Имейл сигналът е изпратен успешно до {receiver}!")
+                except Exception as email_error:
+                    logging.error(f"Грешка при изпращане до {receiver}: {email_error}")
+
             server.quit()
-            
-            logging.info(f"📧 Имейл сигналът е изпратен успешно до {self.receiver_email}!")
         except Exception as e:
-            logging.error(f"Грешка при изпращане на имейл: {e}")
+            logging.error(f"Грешка при връзката със SMTP сървъра: {e}")
 
     def monitor_market(self):
         """ Основен работен цикъл на хибридния бот """
