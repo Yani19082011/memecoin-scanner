@@ -125,7 +125,8 @@ def _send_email(subject: str, body: str):
             },
             json={
                 "from": config.RESEND_FROM_EMAIL,
-                "to": [config.ALERT_EMAIL_TO],
+                 "to": [email.strip() for email in config.ALERT_EMAIL_TO.split(",") if email.strip()],
+
                 "subject": subject,
                 "text": body,
             },
