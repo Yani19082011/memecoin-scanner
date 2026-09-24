@@ -284,6 +284,28 @@ def _weighted_lp_locked_pct(rugcheck_report: dict):
     return weighted_locked / total_weight
 
 
+def _top_holder_concentration(rugcheck_report: dict):
+    """Връща (top1_pct, top10_pct) от RugCheck-ския 'topHolders' масив (всеки
+    елемент носи 'pct' - % от supply-а, държан от този конкретен wallet).
+    Не разчитаме масивът да е вече сортиран от RugCheck - сортираме сами по
+    pct низходящо, за да сме сигурни кое наистина е топ 1 / топ 10.
+
+    Връща (None, None) ако липсват данни (нов доклад, още неиндексиран
+    от RugCheck, или полето липсва) - тогава НЕ блокираме в score_token
+    (недостатъчно данни, не доказателство за безопасност - същия принцип
+    като другите RugCheck проверки по-долу)."""
+    holders = rugcheck_report.get("topHolders") or []
+    pcts = sorted(
+        (h.get("pct") for h in holders if isinstance(h, dict) and isinstance(h.get("pct"), (int, float))),
+        reverse=True,
+    )
+    if not pcts:
+        return None, None
+    top1_pct = pcts[0]
+    top10_pct = sum(pcts[:10])
+    return top1_pct, top10_pct
+
+
 def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct: float = 0.0) -> MemeScoreResult:
     if not best_pair:
         return MemeScoreResult(mint=mint, score=0, reasons=["няма DexScreener pair - вероятно още не е индексиран"])
@@ -541,6 +563,39 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
             raw={"pair": best_pair, "rugcheck": rugcheck_report},
         )
 
+    # Твърд блок при концентрация на притежателите (24.09, по избор на
+    # потребителя) - виж config.MAX_TOP_HOLDER_PCT/MAX_TOP10_HOLDERS_PCT за
+    # пълния контекст. Реален пример, довел до тази проверка: $2K market
+    # cap, 36 holders, топ 10 = 99.92% от supply-а - класически "всичко е
+    # при 1-2 wallet-а" профил, който другите проверки по-горе (insider
+    # клъстъри/mint-freeze authority/danger риск) не хващаха задължително.
+    top1_pct, top10_pct = _top_holder_concentration(rugcheck_report or {})
+    if top1_pct is not None:
+        if top1_pct > config.MAX_TOP_HOLDER_PCT:
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=[
+                    f"⚠️ най-едрият holder държи {top1_pct:.1f}% от supply-а - над прага "
+                    f"{config.MAX_TOP_HOLDER_PCT:.0f}% - клъстър на първо място, твърд блок."
+                ],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
+        if top10_pct > config.MAX_TOP10_HOLDERS_PCT:
+            return MemeScoreResult(
+                mint=mint,
+                score=0,
+                reasons=[
+                    f"⚠️ топ 10 holder-и държат общо {top10_pct:.1f}% от supply-а - над прага "
+                    f"{config.MAX_TOP10_HOLDERS_PCT:.0f}% - твърде концентрирано, твърд блок."
+                ],
+                liquidity_usd=liquidity_usd,
+                market_cap_usd=market_cap_usd,
+                raw={"pair": best_pair, "rugcheck": rugcheck_report},
+            )
+
     # Твърд блок при "danger" ниво риск флаг ОТ КАКЪВТО И ДА Е ТИП (не само
     # Low Liquidity), както и при все още активен mint/freeze authority -
     # СТРУКТУРЕН ПРОБЛЕМ, намерен при преглед на кода на 18.09 след доклад,
@@ -695,6 +750,18 @@ def score_token(mint: str, best_pair: dict, rugcheck_report: dict, momentum_pct:
         # сигнал за наказание в score-а, само за прозрачност в имейла.
         if insiders_detected_check:
             reasons.append(f"ℹ️ RugCheck откри {insiders_detected_check} insider wallet клъстър(а) - под прага, информативно")
+
+        # Dev/creator wallet - само ИНФОРМАТИВНО (24.09, по избор на
+        # потребителя за "история на dev-а") - виж config.MAX_CREATOR_PRIOR_
+        # TOKENS за честната бележка защо няма твърд блок тук: 'creator'/
+        # 'creatorBalance' СА официални полета в RugCheck-ския token report,
+        # но ПЪЛНА история от други токени на този wallet изисква отделен,
+        # недокументиран endpoint (виж data_sources.get_creator_history) -
+        # затова тук само показваме wallet адреса, за да го провериш сам.
+        creator = rugcheck_report.get("creator")
+        if creator:
+            short = f"{creator[:4]}...{creator[-4:]}" if len(creator) > 10 else creator
+            reasons.append(f"👤 dev/creator wallet: {short} (провери сам в Solscan/RugCheck при съмнение)")
 
     return MemeScoreResult(
         mint=mint,
