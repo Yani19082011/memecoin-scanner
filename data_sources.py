@@ -10,15 +10,32 @@ Wrapper-и над публичните безплатни API-та за on-chain
 тук, ако DexScreener/RugCheck са сменили схемата си междувременно.
 """
 import logging
-import requests
+import time
 
-import config
+import requests
 
 log = logging.getLogger("data_sources")
 
+# Retry при 429 от DexScreener - живи Render логове (17.09) показаха, че
+# ДОРИ след batch-ването (1 заявка за 8 адреса вместо 8 отделни) пак
+# получаваме 429 - значи лимитът е по-строг от очакваното, или Render
+# безплатният tier споделя изходящ IP с други потребители, които вече го
+# наближават (извън наш контрол). Кратко изчакване + retry често е
+# достатъчно, защото повечето подобни лимити са rolling-window (изчистват
+# се след няколко секунди), не твърд таван за деня.
+DEXSCREENER_MAX_RETRIES = 3
+DEXSCREENER_RETRY_BASE_DELAY_SECONDS = 3
+
+
+def _sort_pairs_by_liquidity(pairs: list[dict]) -> list[dict]:
+    pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0), reverse=True)
+    return pairs
+
 
 def get_dexscreener_pairs(mint_address: str) -> list[dict]:
-    """Връща списък от DEX двойки за токена (Raydium/PumpSwap/...), най-ликвидната първа."""
+    """Връща списък от DEX двойки за токена (Raydium/PumpSwap/...), най-ликвидната първа.
+    Виж get_dexscreener_pairs_batch() за batch версията, ползвана от main.py при
+    следене на много монети едновременно (за да не удряме DexScreener rate limit-а)."""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address}"
     try:
         r = requests.get(url, timeout=10)
@@ -27,16 +44,106 @@ def get_dexscreener_pairs(mint_address: str) -> list[dict]:
     except Exception as e:
         log.warning("DexScreener fail за %s: %s", mint_address, e)
         return []
-    pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0), reverse=True)
-    return pairs
+    return _sort_pairs_by_liquidity(pairs)
+
+
+# DexScreener позволява няколко token адреса в ЕДНА заявка, разделени със
+# запетая (потвърдено чрез живо тестване 17.09 - връща pairs и за двата
+# адреса в тестов пример) - точен максимален брой на заявка НЕ е официално
+# документиран, 30 е консервативна, разумна стойност (често срещана норма
+# при подобни batch API-та).
+DEXSCREENER_BATCH_SIZE = 30
+
+
+def _fetch_dexscreener_chunk(chunk: list[str]):
+    """Едно HTTP повикване за един chunk от адреси, с retry+backoff при 429.
+    Връща списъка от pairs (може да е []), или None ако всички опити
+    паднаха (извикващият код тогава просто пропуска този chunk тази
+    обиколка - следващата обиколка ще опита пак)."""
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
+    delay = DEXSCREENER_RETRY_BASE_DELAY_SECONDS
+
+    for attempt in range(1, DEXSCREENER_MAX_RETRIES + 1):
+        try:
+            r = requests.get(url, timeout=15)
+            if r.status_code == 429:
+                if attempt < DEXSCREENER_MAX_RETRIES:
+                    log.warning(
+                        "DexScreener 429 за %d адреса (опит %d/%d) - изчаквам %dс и пробвам пак...",
+                        len(chunk), attempt, DEXSCREENER_MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                    delay *= 2
+                    continue
+                log.warning(
+                    "DexScreener 429 за %d адреса - изчерпани %d опита, пропускам този chunk тази обиколка.",
+                    len(chunk), DEXSCREENER_MAX_RETRIES,
+                )
+                return None
+            r.raise_for_status()
+            return r.json().get("pairs") or []
+        except Exception as e:
+            log.warning("DexScreener batch fail за %d адреса: %s", len(chunk), e)
+            return None
+    return None
+
+
+def get_dexscreener_pairs_batch(mint_addresses: list[str]) -> dict[str, list[dict]]:
+    """Batch версия на get_dexscreener_pairs() - ЕДНА HTTP заявка за до
+    DEXSCREENER_BATCH_SIZE адреса наведнъж, вместо по една заявка на монета.
+
+    Защо е нужно: при следене на 20+ монети едновременно, ако всяка сама
+    си пита DexScreener на всеки poll (виж main.py::monitor_token), общият
+    брой заявки/минута лесно удря DexScreener-ския rate limit -> 429 Too
+    Many Requests -> изгубени/забавени ценови данни точно когато монетата
+    реално мърда (потвърдено в живите Render логове 17.09). Batch заявките
+    намаляват броя HTTP повиквания ~30x за същото покритие.
+
+    Връща {mint: sorted_pairs_list} за всеки заявен адрес (празен списък
+    ако адресът не е намерен/грешка в конкретния chunk - не гърми целия
+    batch заради един лош chunk)."""
+    result: dict[str, list[dict]] = {addr: [] for addr in mint_addresses}
+    if not mint_addresses:
+        return result
+
+    for i in range(0, len(mint_addresses), DEXSCREENER_BATCH_SIZE):
+        chunk = mint_addresses[i:i + DEXSCREENER_BATCH_SIZE]
+        pairs = _fetch_dexscreener_chunk(chunk)
+        if pairs is None:
+            continue  # изчерпани retry опити за този chunk - пропускаме тази обиколка
+
+        chunk_set = set(chunk)
+        for pair in pairs:
+            base_addr = (pair.get("baseToken") or {}).get("address")
+            quote_addr = (pair.get("quoteToken") or {}).get("address")
+            matched = base_addr if base_addr in chunk_set else (quote_addr if quote_addr in chunk_set else None)
+            if matched:
+                result[matched].append(pair)
+
+    for addr, pairs in result.items():
+        if pairs:
+            result[addr] = _sort_pairs_by_liquidity(pairs)
+    return result
 
 
 def get_rugcheck_report(mint_address: str) -> dict:
-    """RugCheck риск доклад. Публичен endpoint, без ключ за базов report (виж бележката горе)."""
+    """RugCheck риск доклад. Публичен endpoint, без ключ за базов report (виж бележката горе).
+
+    ВАЖНО (18.09, намерено при преглед на живи Render логове - потребителят
+    докладва "bad request и други глупости" запушващи лога): RugCheck връща
+    HTTP 400 (не 404) за монета, която е реална, но още не е индексирана от
+    техния анализатор - буквално за ВСЯКА прясно graduated монета в първите
+    секунди/минути. Преди тук третирахме само 404 тихо, а 400 падаше в
+    except клона и печаташе WARNING на ВСЕКИ poll за почти всяка следена
+    монета - чист шум в логовете, без реален функционален проблем (score_token
+    вече обработва празен report грациозно - вижда се от "reasons"-а в
+    имейла). Сега и 400, и 404 се третират еднакво тихо ("още няма доклад") -
+    периодичното опресняване (config.RUGCHECK_REFRESH_EVERY_N_POLLS) пак ще
+    хване доклада веднага щом RugCheck реално го индексира."""
     url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report"
     try:
         r = requests.get(url, timeout=10, headers={"Accept": "application/json"})
-        if r.status_code == 404:
+        if r.status_code in (400, 404):
             return {}
         r.raise_for_status()
         report = r.json()
