@@ -1,0 +1,344 @@
+"""
+Изпращане на алърти. Два канала:
+  - лог (винаги, вижда се в Render "Logs" таба)
+  - email през Resend (https://resend.com) - HTTP API, само ако
+    ALERT_EMAIL_ENABLED=true и RESEND_API_KEY е попълнен.
+
+Забележка: НЕ ползваме Gmail SMTP/App Password, защото Google не позволява
+App Passwords на Family Link (supervised) акаунти. Resend е безплатна услуга,
+праща email през обикновен HTTP POST с API ключ - виж README.md за стъпките.
+"""
+import logging
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import requests
+
+import config
+from scoring import MemeScoreResult
+
+log = logging.getLogger("notifier")
+
+RESEND_API_URL = "https://api.resend.com/emails"
+
+
+def _accounts() -> list[tuple[str, str]]:
+    """Списък от (api_key, to_email) двойки, през които да пратим email.
+
+    ВАЖНО (23.09, намерено в живи Render логове - Resend отказа ПЪРВИЯ реален
+    алърт с HTTP 403): безплатният Resend "sandbox" режим (без верифициран
+    собствен домейн) позволява изпращане САМО до имейла, с който е
+    регистриран акаунтът - никакъв друг адрес, независимо дали е добавен в
+    "to" списъка на един email или пратен през отделна заявка. Затова "2
+    отделни имейла" (по избор на потребителя) реално изисква ДВА отделни
+    Resend акаунта - всеки регистриран с и позволен само до своя собствен
+    адрес - виж config.RESEND_API_KEY_2/ALERT_EMAIL_TO_2. Ако вторият не е
+    конфигуриран, просто се пропуска (не гърми нищо) - основният адрес пак
+    си работи нормално."""
+    accounts = []
+    if config.RESEND_API_KEY and config.ALERT_EMAIL_TO:
+        accounts.append((config.RESEND_API_KEY, config.ALERT_EMAIL_TO))
+    if config.RESEND_API_KEY_2 and config.ALERT_EMAIL_TO_2:
+        accounts.append((config.RESEND_API_KEY_2, config.ALERT_EMAIL_TO_2))
+    return accounts
+
+# --- "Копирай адреса" ---
+# ВАЖНО (18.09): преди тук имаше бутон-линк към отделна MintClip страничка
+# (Claude Artifact), която да чете адреса от URL параметър и да копира с
+# едно докосване - идеята беше "email клиентите блокират JS, затова води
+# към страница, която МОЖЕ да го направи". Оказа се, че Claude Artifact
+# страниците се render-ват в sandbox iframe, който НЕ получава URL
+# параметрите на външния линк изобщо (потвърдено с реален тест в браузър) -
+# страницата винаги показваше "няма адрес", независимо какво е в линка.
+# Това е ограничение на самата платформа, не поправим откъм HTML/JS код тук.
+# Решение вместо това: адресът вече стои в имейла като ясно откроен,
+# избираем текст - на телефон, задържане с пръст върху него показва системно
+# "Copy" меню автоматично, без нужда от външна страница или бутон.
+
+
+def _within_active_hours() -> bool:
+    """Проверява дали текущият момент е в разрешения прозорец за имейли
+    (config.ALERT_ACTIVE_START_* / ALERT_ACTIVE_END_* в ALERT_QUIET_HOURS_TZ).
+    Ако timezone данните липсват по някаква причина - НЕ блокираме (по-добре
+    да получиш имейл в грешен час, отколкото да мълчим заради bug)."""
+    try:
+        tz = ZoneInfo(config.ALERT_QUIET_HOURS_TZ)
+    except Exception as e:
+        log.warning("ALERT_QUIET_HOURS_TZ (%s) невалиден: %s - пропускам проверката за часове.", config.ALERT_QUIET_HOURS_TZ, e)
+        return True
+    now_local = datetime.now(tz)
+    start = now_local.replace(hour=config.ALERT_ACTIVE_START_HOUR, minute=config.ALERT_ACTIVE_START_MINUTE, second=0, microsecond=0)
+    end = now_local.replace(hour=config.ALERT_ACTIVE_END_HOUR, minute=config.ALERT_ACTIVE_END_MINUTE, second=0, microsecond=0)
+    return start <= now_local <= end
+
+# --- Anti-spam темпо-ограничител за Resend (виж config.MIN_EMAIL_INTERVAL_SECONDS /
+# MAX_EMAILS_PER_DAY) - пази в паметта на процеса, реду се при restart на Render,
+# но това е ок - целта е само да не гърмим 20 имейла наведнъж при серия алърти. ---
+_last_sent_at = None
+_daily_count = 0
+_daily_reset_date = None
+
+
+def _rate_limit_ok() -> bool:
+    global _last_sent_at, _daily_count, _daily_reset_date
+    now = datetime.now(timezone.utc)
+    today = now.date()
+
+    if _daily_reset_date != today:
+        _daily_reset_date = today
+        _daily_count = 0
+
+    if _daily_count >= config.MAX_EMAILS_PER_DAY:
+        log.warning(
+            "Дневният лимит от %d имейла е достигнат - пропускам email-а (алъртът е в логовете).",
+            config.MAX_EMAILS_PER_DAY,
+        )
+        return False
+
+    if _last_sent_at is not None:
+        elapsed = (now - _last_sent_at).total_seconds()
+        if elapsed < config.MIN_EMAIL_INTERVAL_SECONDS:
+            log.info(
+                "Прескачам email (анти-спам темпо) - оставащи %.0fс до следващия разрешен имейл.",
+                config.MIN_EMAIL_INTERVAL_SECONDS - elapsed,
+            )
+            return False
+
+    return True
+
+
+def _mark_email_sent():
+    global _last_sent_at, _daily_count
+    _last_sent_at = datetime.now(timezone.utc)
+    _daily_count += 1
+
+
+def format_alert(result: MemeScoreResult) -> str:
+    dexscreener_link = f"https://dexscreener.com/solana/{result.mint}"
+    lines = [
+        f"Coin ID (mint): {result.mint}",
+        f"Score: {result.score}/100 | Потенциал: {result.estimated_multiplier}",
+        f"Ликвидност: ${result.liquidity_usd:,.0f}",
+        f"Market Cap: ${result.market_cap_usd:,.0f}" if result.market_cap_usd else "Market Cap: няма данни",
+        f"Оценка (спекулативна, НЕ прогноза): {result.potential_label}" if result.potential_label else "",
+        f"DexScreener: {dexscreener_link}",
+        "Причини: " + "; ".join(result.reasons) if result.reasons else "",
+        "",
+        "Не е финансов съвет - graduated memecoin-ите са изключително волатилни и рискови.",
+    ]
+    return "\n".join(l for l in lines if l is not None)
+
+
+def format_alert_html(result: MemeScoreResult) -> str:
+    """HTML версия за email-а. Адресът е показан като ясно откроен, избираем
+    текстов блок (виж коментара горе за "Копирай адреса" - защо няма линк/
+    бутон към отделна страница) - на телефон, задържане с пръст върху него
+    показва системно "Copy" меню автоматично."""
+    dexscreener_link = f"https://dexscreener.com/solana/{result.mint}"
+    market_cap_html = f"${result.market_cap_usd:,.0f}" if result.market_cap_usd else "няма данни"
+    potential_html = (
+        f"<p style='margin:0 0 12px;color:#12161f;'><b>Оценка:</b> {result.potential_label}</p>"
+        if result.potential_label else ""
+    )
+    reasons_html = (
+        "<p style='margin:0 0 6px;color:#12161f;'><b>Причини:</b></p>"
+        "<ul style='margin:0 0 16px;padding-left:18px;color:#333;'>"
+        + "".join(f"<li style='margin:0 0 4px;'>{r}</li>" for r in result.reasons)
+        + "</ul>"
+    ) if result.reasons else ""
+
+    return f"""
+    <div style="font-family:-apple-system,'Segoe UI',Roboto,sans-serif;max-width:480px;margin:0 auto;color:#12161f;">
+      <h2 style="margin:0 0 14px;">🚀 Memecoin алърт</h2>
+      <p style="margin:0 0 4px;"><b>Score:</b> {result.score}/100 ({result.estimated_multiplier})</p>
+      <p style="margin:0 0 4px;"><b>Ликвидност:</b> ${result.liquidity_usd:,.0f}</p>
+      <p style="margin:0 0 12px;"><b>Market Cap:</b> {market_cap_html}</p>
+      {potential_html}
+      <p style="margin:0 0 6px;color:#666f80;font-size:12px;">📋 Адрес на монетата - кликни/задръж върху него, после Ctrl+C (компютър) или "Copy" от менюто (телефон):</p>
+      <p style="margin:0 0 16px;font-family:'SFMono-Regular',Consolas,monospace;font-size:14px;
+                word-break:break-all;background:#f1f3f6;padding:14px 12px;border-radius:8px;color:#12161f;
+                border:1px solid #dde1e8;user-select:all;-webkit-user-select:all;">
+        {result.mint}
+      </p>
+      <p style="margin:0 0 16px;text-align:center;">
+        <a href="{dexscreener_link}" style="color:#5b47e0;text-decoration:none;">Виж в DexScreener →</a>
+      </p>
+      {reasons_html}
+      <p style="color:#8a93a6;font-size:12px;margin-top:18px;">
+        Не е финансов съвет - graduated memecoin-ите са изключително волатилни и рискови.
+      </p>
+    </div>
+    """
+
+
+def can_send_now() -> bool:
+    """Pure "peek" (не мърда никакво състояние) - True ако email, пратен точно
+    СЕГА, НЕ би бил пропуснат заради anti-spam темпото
+    (MIN_EMAIL_INTERVAL_SECONDS/MAX_EMAILS_PER_DAY).
+
+    ЗАЩО СЪЩЕСТВУВА (18.09, по изричен избор на потребителя): main.py я
+    ползва, за да прецени ПРЕДИ да похарчи финалната live проверка, дали
+    изобщо си струва - ако темпото не позволява, main.py::monitor_token НЕ
+    спира да следи монетата (не праща стари данни по-късно), а просто чака
+    следващия poll и проверява пак с ПРЕСНИ данни, докато или темпото се
+    освободи, или monitoring прозорецът (MONITOR_WINDOW_MINUTES) изтече.
+    Преди тази промяна: ако две добри монети се потвърдяха в рамките на
+    същия ~5-мин anti-spam прозорец, втората се губеше напълно (само лог,
+    без email) - потребителят изрично поиска да не се случва това."""
+    return _rate_limit_ok()
+
+
+def send_alert(result: MemeScoreResult) -> bool:
+    """Връща True ако е "обработено" (email пратен успешно, ИЛИ email-ите са
+    изключени/не са конфигурирани, ИЛИ извън разрешените часове - в тези
+    случаи чакане не помага, няма смисъл от retry), False САМО когато е
+    пропуснат чисто заради anti-spam темпото - виж can_send_now() по-горе за
+    защо тази разлика има значение за main.py::monitor_token."""
+    message = format_alert(result)
+    log.info("MEMECOIN ALERT:\n%s", message)
+
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    return _send_email(
+        subject=f"[Memecoin Scanner] {result.mint[:8]}... - {result.estimated_multiplier}",
+        body=message,
+        html=format_alert_html(result),
+    )
+
+
+def send_watch_digest(result: MemeScoreResult) -> bool:
+    """Периодичен 'heartbeat' email на всеки config.MIN_EMAIL_INTERVAL_SECONDS
+    (18.09 вечерта, по изричен избор на потребителя: "изпраща ми имейл на
+    всеки 5 минути за койн", "не да седи на един") - показва НАЙ-ДОБРАТА в
+    момента следена монета, дори да НЕ е минала целия HIGH_POTENTIAL_
+    THRESHOLD/MIN_POLLS_BEFORE_ALERT процес на потвърждение. За разлика от
+    send_alert() (пълен потвърден сигнал), тук ЯСНО пишем в темата и тялото,
+    че е само периодична, непотвърдена информация - за да не се обърка с
+    истински потвърден алърт. Ползва СЪЩИЯ _send_email()/anti-spam темпо
+    като send_alert(), затова не може да удвои честотата отгоре."""
+    message = (
+        "⏳ ПЕРИОДИЧНА МОНЕТА - все още НЕ е напълно потвърдена (score под прага, или чака още "
+        "последователни проверки) - показана само защото е най-добрата в момента следена.\n\n"
+        + format_alert(result)
+    )
+    log.info("MEMECOIN WATCH DIGEST:\n%s", message)
+
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    html = (
+        "<p style='margin:0 0 14px;padding:10px 12px;background:#fff6e5;border-radius:8px;"
+        "color:#a66b00;font-weight:600;'>⏳ Периодична монета - все още НЕ е напълно потвърдена "
+        "(score под прага, или чака още проверки) - само информативно, показана защото в момента "
+        "е най-добрата следена.</p>"
+        + format_alert_html(result)
+    )
+    return _send_email(
+        subject=f"[Memecoin Scanner] (непотвърдено, score {result.score:.0f}) {result.mint[:8]}...",
+        body=message,
+        html=html,
+    )
+
+
+def send_early_gem_alert(result: MemeScoreResult, creator_history: dict, has_social_presence: bool) -> bool:
+    """"Ранна монета" - ОТДЕЛЕН, по-рядък сигнал (24.09, по избор на
+    потребителя) - виж config.EARLY_GEM_* за пълния контекст. Пращан ВЕДНЪЖ
+    на монета, докато market cap-ът ѝ е още в ранния диапазон - за разлика от
+    send_alert() (чака потвърден моментум) и send_watch_digest() (просто
+    "най-добрата в момента"), тук скоростта е приоритет пред потвърждението.
+
+    ЧЕСТНА БЕЛЕЖКА в самия имейл (не само в кода) - за да не се получи
+    невярно усещане за сигурност."""
+    prior_tokens = creator_history.get("token_count") if creator_history else None
+    dev_note = (
+        f"⚠️ dev wallet-ът е пуснал още {prior_tokens:.0f} токена преди тази (RugCheck, best-effort данни) - "
+        f"провери сам преди да влезеш." if isinstance(prior_tokens, (int, float)) and prior_tokens > config.MAX_CREATOR_PRIOR_TOKENS
+        else ("ℹ️ няма (надеждни) данни за други токени на този dev wallet." if prior_tokens is None
+              else f"ℹ️ dev wallet-ът има {prior_tokens:.0f} други токена - под прага, информативно.")
+    )
+    social_note = (
+        "✅ монетата има социални линкове (Twitter/Telegram/website) в DexScreener - грубо 'hype' proxy."
+        if has_social_presence else
+        "ℹ️ няма социални линкове в DexScreener все още - не значи задължително лошо, просто по-малко видимост."
+    )
+    message = (
+        f"💎 РАННА МОНЕТА - market cap все още в ранния диапазон "
+        f"(${config.EARLY_GEM_MIN_MC:,.0f}-${config.EARLY_GEM_MAX_MC:,.0f}), score {result.score:.0f} - "
+        "изпратено ВЕДНАГА (без да чакаме потвърждение), за да имаш шанс да влезеш рано.\n"
+        f"{dev_note}\n{social_note}\n\n"
+        "⚠️ ЧЕСТНО: това НЕ е гаранция, че ще стигне по-висок market cap - никой безплатен инструмент не "
+        "може да предскаже това. Профилът ѝ просто изглежда добре точно сега.\n\n"
+        + format_alert(result)
+    )
+    log.info("MEMECOIN EARLY GEM:\n%s", message)
+
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    html = (
+        "<p style='margin:0 0 14px;padding:10px 12px;background:#e8f9ee;border-radius:8px;"
+        "color:#0a7a3d;font-weight:600;'>💎 Ранна монета - все още в ранния market cap диапазон, "
+        "изпратено веднага без да чакаме потвърждение. Не е гаранция за по-нататъшен ръст.</p>"
+        + format_alert_html(result)
+    )
+    return _send_email(
+        subject=f"[Memecoin Scanner] 💎 РАННА МОНЕТА - {result.mint[:8]}... (score {result.score:.0f})",
+        body=message,
+        html=html,
+    )
+
+
+def _send_email(subject: str, body: str, html: str = None) -> bool:
+    """Връща True ако е "приключено" (пратен успешно поне през една сметка,
+    или причината да не се прати НЕ е anti-spam темпото - конфигурация/
+    часове/HTTP грешка, retry не би помогнал), False САМО ако е пропуснат
+    чисто заради темпото (виж can_send_now()/send_alert() по-горе).
+
+    Праща ОТДЕЛНА HTTP заявка за ВСЯКА конфигурирана (api_key, адрес) двойка
+    от _accounts() - виж коментара там за защо (Resend sandbox ограничение:
+    всеки акаунт може да праща само до собствения си регистриран адрес)."""
+    accounts = _accounts()
+    if not accounts:
+        log.warning("Email алъртите са включени, но RESEND_API_KEY/ALERT_EMAIL_TO не са попълнени.")
+        return True
+    if not _within_active_hours():
+        log.info(
+            "Извън разрешените часове за имейли (%02d:%02d-%02d:%02d %s) - пропускам email-а (алъртът е в логовете).",
+            config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
+            config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ,
+        )
+        return True
+    if not _rate_limit_ok():
+        return False
+
+    any_success = False
+    for api_key, to_email in accounts:
+        payload = {
+            "from": config.RESEND_FROM_EMAIL,
+            "to": [to_email],
+            "subject": subject,
+            "text": body,
+        }
+        if html:
+            # Resend показва html, ако е налично - text си остава fallback за
+            # клиенти, които не го рендират. Виж format_alert_html() за бутона.
+            payload["html"] = html
+        try:
+            resp = requests.post(
+                RESEND_API_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code >= 300:
+                log.error("Resend отказа изпращането до %s (%s): %s", to_email, resp.status_code, resp.text)
+                continue  # HTTP грешка за тази сметка - пробваме следващата (ако има)
+            log.info("Email алърт изпратен до %s през Resend", to_email)
+            any_success = True
+        except Exception as e:
+            log.error("Изпращането на email до %s през Resend се провали: %s", to_email, e)
+
+    if any_success:
+        _mark_email_sent()
+    return True  # HTTP/конфигурационна грешка за отделна сметка не е anti-spam темпо - retry тук не би помогнал
