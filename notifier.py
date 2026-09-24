@@ -239,6 +239,53 @@ def send_watch_digest(result: MemeScoreResult) -> bool:
     )
 
 
+def send_early_gem_alert(result: MemeScoreResult, creator_history: dict, has_social_presence: bool) -> bool:
+    """"Ранна монета" - ОТДЕЛЕН, по-рядък сигнал (24.09, по избор на
+    потребителя) - виж config.EARLY_GEM_* за пълния контекст. Пращан ВЕДНЪЖ
+    на монета, докато market cap-ът ѝ е още в ранния диапазон - за разлика от
+    send_alert() (чака потвърден моментум) и send_watch_digest() (просто
+    "най-добрата в момента"), тук скоростта е приоритет пред потвърждението.
+
+    ЧЕСТНА БЕЛЕЖКА в самия имейл (не само в кода) - за да не се получи
+    невярно усещане за сигурност."""
+    prior_tokens = creator_history.get("token_count") if creator_history else None
+    dev_note = (
+        f"⚠️ dev wallet-ът е пуснал още {prior_tokens:.0f} токена преди тази (RugCheck, best-effort данни) - "
+        f"провери сам преди да влезеш." if isinstance(prior_tokens, (int, float)) and prior_tokens > config.MAX_CREATOR_PRIOR_TOKENS
+        else ("ℹ️ няма (надеждни) данни за други токени на този dev wallet." if prior_tokens is None
+              else f"ℹ️ dev wallet-ът има {prior_tokens:.0f} други токена - под прага, информативно.")
+    )
+    social_note = (
+        "✅ монетата има социални линкове (Twitter/Telegram/website) в DexScreener - грубо 'hype' proxy."
+        if has_social_presence else
+        "ℹ️ няма социални линкове в DexScreener все още - не значи задължително лошо, просто по-малко видимост."
+    )
+    message = (
+        f"💎 РАННА МОНЕТА - market cap все още в ранния диапазон "
+        f"(${config.EARLY_GEM_MIN_MC:,.0f}-${config.EARLY_GEM_MAX_MC:,.0f}), score {result.score:.0f} - "
+        "изпратено ВЕДНАГА (без да чакаме потвърждение), за да имаш шанс да влезеш рано.\n"
+        f"{dev_note}\n{social_note}\n\n"
+        "⚠️ ЧЕСТНО: това НЕ е гаранция, че ще стигне по-висок market cap - никой безплатен инструмент не "
+        "може да предскаже това. Профилът ѝ просто изглежда добре точно сега.\n\n"
+        + format_alert(result)
+    )
+    log.info("MEMECOIN EARLY GEM:\n%s", message)
+
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    html = (
+        "<p style='margin:0 0 14px;padding:10px 12px;background:#e8f9ee;border-radius:8px;"
+        "color:#0a7a3d;font-weight:600;'>💎 Ранна монета - все още в ранния market cap диапазон, "
+        "изпратено веднага без да чакаме потвърждение. Не е гаранция за по-нататъшен ръст.</p>"
+        + format_alert_html(result)
+    )
+    return _send_email(
+        subject=f"[Memecoin Scanner] 💎 РАННА МОНЕТА - {result.mint[:8]}... (score {result.score:.0f})",
+        body=message,
+        html=html,
+    )
+
+
 def _send_email(subject: str, body: str, html: str = None) -> bool:
     """Връща True ако е "приключено" (пратен успешно поне през една сметка,
     или причината да не се прати НЕ е anti-spam темпото - конфигурация/
