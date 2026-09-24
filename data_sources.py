@@ -154,6 +154,36 @@ def get_rugcheck_report(mint_address: str) -> dict:
         return {}
 
 
+def get_creator_history(creator_address: str) -> dict:
+    """Best-effort проверка колко други токена е пуснал този wallet (24.09,
+    по избор на потребителя за 'история на dev-а').
+
+    ЧЕСТНО ПРЕДУПРЕЖДЕНИЕ: RugCheck НЕ документира публично 'wallet history'
+    endpoint - това е разумен опит по аналогия с останалите им пътища
+    (/v1/tokens/... -> тук пробваме /v1/wallets/.../tokens). Ако RugCheck
+    върне грешка/друг формат, просто третираме като 'няма данни' (връщаме
+    {}), НЕ гърми и НЕ блокира нищо - виж config.MAX_CREATOR_PRIOR_TOKENS за
+    как се ползва резултатът (само информативно, не твърд блок точно защото
+    схемата тук е несигурна)."""
+    if not creator_address:
+        return {}
+    url = f"https://api.rugcheck.xyz/v1/wallets/{creator_address}/tokens"
+    try:
+        r = requests.get(url, timeout=10, headers={"Accept": "application/json"})
+        if r.status_code in (400, 404):
+            return {}
+        r.raise_for_status()
+        data = r.json()
+        # Пробваме няколко разумни форми - списък директно, или обвит в поле.
+        tokens = data if isinstance(data, list) else (data.get("tokens") or data.get("data") or [])
+        if not isinstance(tokens, list):
+            return {}
+        return {"token_count": len(tokens)}
+    except Exception as e:
+        log.debug("get_creator_history за %s: няма данни (%s)", creator_address, e)
+        return {}
+
+
 def extract_mint_address(migration_event: dict) -> str | None:
     """
     PumpPortal не публикува верижна схема за migration съобщението - пробваме
