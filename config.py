@@ -206,12 +206,31 @@ ALERT_EMAIL_ENABLED = _bool("ALERT_EMAIL_ENABLED", False)
 # акаунти не позволяват App Passwords изобщо. Виж README.md за регистрация.
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
-# ПРОМЯНА (23.09, по изричен избор на потребителя: "искам да изпраща на 2
-# отделни имейла нотификации") - ALERT_EMAIL_TO вече поддържа НЯКОЛКО адреса,
-# разделени със запетая - notifier.py::_recipients() ги разделя и праща
-# ВСЕКИ email (истински алърт И периодичен digest) до всички наведнъж.
-# Втори адрес потвърден директно от потребителя.
-ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com,crafts0man0@gmail.com")
+# ВАЖНО (23.09, намерено в живи Render логове веднага след първия реален
+# алърт): пробвахме ALERT_EMAIL_TO с 2 адреса (по избор на потребителя,
+# "искам да изпраща на 2 отделни имейла") - Resend го отказа НАПЪЛНО с
+# HTTP 403: "You can only send testing emails to your own email address
+# (yani.kolev2011@gmail.com). To send emails to other recipients, please
+# verify a domain at resend.com/domains...". Причината: безплатният Resend
+# "sandbox" режим (без верифициран собствен домейн) позволява изпращане
+# САМО до имейла, с който е регистриран акаунтът - никакви други адреси,
+# независимо дали са в 'to' списъка на един email или в отделни заявки.
+# Затова ALERT_EMAIL_TO се връща на ЕДИН адрес (иначе ВСИЧКИ email-и,
+# включително истинските потвърдени алърти, спират да излизат). Вторият
+# адрес (crafts0man0@gmail.com) вижте RESEND_API_KEY_2/ALERT_EMAIL_TO_2
+# по-долу - отделен, безплатен Resend акаунт е единственият начин да се
+# праща и до втори адрес БЕЗ да се купува/верифицира собствен домейн.
+ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com")
+
+# --- Втори получател (по избор) - изисква ОТДЕЛЕН, собствен Resend акаунт ---
+# Всеки безплатен Resend акаунт (без верифициран домейн) може да праща
+# email само до адреса, с който е регистриран - виж бележката по-горе.
+# За да стигат известията и до ВТОРИ адрес безплатно, трябва ВТОРИ Resend
+# акаунт, регистриран директно с този втори имейл (напр. crafts0man0@
+# gmail.com), с негов СОБСТВЕН API ключ тук. Ако RESEND_API_KEY_2 остане
+# празен - вторият адрес просто се пропуска мълчаливо (не гърми нищо).
+RESEND_API_KEY_2 = os.getenv("RESEND_API_KEY_2", "")
+ALERT_EMAIL_TO_2 = os.getenv("ALERT_EMAIL_TO_2", "crafts0man0@gmail.com")
 
 # --- Anti-spam защита за Resend дневната квота (безплатен tier = 100 имейла/ден
 # за целия акаунт, споделен с другите ботове, ползващи същия RESEND_API_KEY) ---
