@@ -27,10 +27,13 @@ from flask import Flask, request
 
 import config
 from pumpportal_client import listen_for_migrations
-from data_sources import get_dexscreener_pairs_batch, get_dexscreener_pairs, get_rugcheck_report, extract_mint_address
+from data_sources import (
+    get_dexscreener_pairs_batch, get_dexscreener_pairs, get_rugcheck_report, extract_mint_address,
+    get_creator_history,
+)
 from scoring import score_token
 from seen_store import load_seen, mark_seen
-from notifier import send_alert, can_send_now, send_watch_digest
+from notifier import send_alert, can_send_now, send_watch_digest, send_early_gem_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +72,16 @@ REQUIRED_CONFIG_ATTRS = [
     "WATCH_DIGEST_ENABLED",
     # --- добавено 23.09 - минимален score, за да си струва изобщо digest email ---
     "WATCH_DIGEST_MIN_SCORE",
+    # --- добавено 24.09 - дедупликация на digest-а за една и съща монета ---
+    "WATCH_DIGEST_REPEAT_COOLDOWN_MINUTES",
+    # --- добавено 24.09 - digest интервалът вече е отделен от MIN_EMAIL_
+    # INTERVAL_SECONDS (виж config.py) ---
+    "WATCH_DIGEST_INTERVAL_SECONDS",
+    # --- добавени 24.09 - "ранна монета" (early gem) + dev/creator история,
+    # по избор на потребителя ---
+    "EARLY_GEM_ENABLED", "EARLY_GEM_MIN_MC", "EARLY_GEM_MAX_MC",
+    "EARLY_GEM_MIN_SCORE", "EARLY_GEM_REQUIRE_SOCIAL_PRESENCE",
+    "MAX_CREATOR_PRIOR_TOKENS",
     # --- добавени 18.09 вечерта - НОВА СТРАТЕГИЯ, "тренд" сигнали (виж
     # scoring.py/config.py) - EXTENDED_MAX_MARKET_CAP_USD/EXTENDED_ZONE_MIN_
     # LIQUIDITY_USD вече НЕ съществуват (старата "разширена зона" е махната,
@@ -77,6 +90,9 @@ REQUIRED_CONFIG_ATTRS = [
     "EARLY_STAGE_FADE_AGE_HOURS", "DEATH_SPIRAL_H1_DROP_PCT",
     "DEATH_SPIRAL_MIN_M5_SELLS", "SUSPICIOUS_AVG_TRADE_SIZE_USD",
     "WASH_TRADE_SIZE_PENALTY_POINTS",
+    # --- добавени 24.09 - твърд блок при концентрация на притежателите
+    # (topHolders от RugCheck), по избор на потребителя ---
+    "MAX_TOP_HOLDER_PCT", "MAX_TOP10_HOLDERS_PCT",
 ]
 
 
@@ -105,7 +121,14 @@ def _startup_self_check():
         "priceChange": {"h1": 15.0},
         "pairCreatedAt": time.time() * 1000 - (3 * 3_600_000),  # ~3ч отпреди
     }
-    fake_rugcheck = {"risks": [], "markets": [], "graphInsidersDetected": 0}
+    fake_rugcheck = {
+        "risks": [], "markets": [], "graphInsidersDetected": 0,
+        # НОВО (24.09) - топ holder концентрация, разпределена достатъчно
+        # широко, за да МИНЕ новия твърд блок (виж config.MAX_TOP_HOLDER_PCT/
+        # MAX_TOP10_HOLDERS_PCT) - целта е самопроверката реално да упражни
+        # _top_holder_concentration(), не просто да заобиколи кода с [].
+        "topHolders": [{"pct": 2.0} for _ in range(8)],
+    }
     try:
         score_token("SelfTest11111111111111111111111111111111111", fake_pair, fake_rugcheck, momentum_pct=30.0)
     except Exception as e:
@@ -139,6 +162,10 @@ _status = {
 }
 _seen = load_seen()
 _monitoring = set()
+# "Ранна монета" дедупликация (24.09) - виж config.EARLY_GEM_* - само в
+# паметта на процеса, нулира се при redeploy/restart (приемливо - иначе би
+# трябвало Upstash за нещо чисто информативно/еднократно).
+_early_gem_alerted: set = set()
 # Заключва достъпа до _monitoring - мутира се от asyncio нишката
 # (monitor_token добавя/маха mint-ове), а се ЧЕТЕ както от Flask нишката
 # (health() route по-долу), така и от _refresh_market_data_loop - без
@@ -169,6 +196,11 @@ _market_data_cache: dict = {}
 #      ясно като "все още не потвърдена", за да не подвежда).
 _latest_scores: dict = {}
 _latest_scores_lock = threading.Lock()
+# Дедупликация на heartbeat digest-а (24.09) - виж config.WATCH_DIGEST_
+# REPEAT_COOLDOWN_MINUTES за пълния контекст (оплакване: "3 поредни имейла
+# за един и същи койн").
+_last_digest_mint: str | None = None
+_last_digest_at = None
 _recent_alerts: list = []
 _recent_alerts_lock = threading.Lock()
 MAX_RECENT_ALERTS = 20
@@ -529,16 +561,18 @@ async def _refresh_market_data_loop():
 
 
 async def _watch_digest_loop():
-    """Периодичен 'heartbeat' email на всеки config.MIN_EMAIL_INTERVAL_SECONDS
+    """Периодичен 'heartbeat' email на всеки config.WATCH_DIGEST_INTERVAL_SECONDS
     (18.09 вечерта, по изричен избор на потребителя: "изпраща ми имейл на
-    всеки 5 минути за койн", "не да седи на един") - виж коментара в
-    notifier.py::send_watch_digest за пълния контекст. Пуска се НЕЗАВИСИМО
-    от monitor_token()-a, но споделя СЪЩОТО anti-spam темпо (notifier.
+    всеки 5 минути за койн"; интервалът стана 10 мин на 24.09, пак по избор
+    на потребителя - виж коментара в config.py защо вече е ОТДЕЛНА настройка
+    от MIN_EMAIL_INTERVAL_SECONDS) - виж коментара в notifier.py::
+    send_watch_digest за пълния контекст. Пуска се НЕЗАВИСИМО от
+    monitor_token()-a, но споделя СЪЩОТО anti-spam темпо (notifier.
     can_send_now()) - ако вече е пратен истински потвърден алърт наскоро,
     просто прескача този цикъл, вместо да удвои честотата."""
     from scoring import MemeScoreResult
     while True:
-        await asyncio.sleep(config.MIN_EMAIL_INTERVAL_SECONDS)
+        await asyncio.sleep(config.WATCH_DIGEST_INTERVAL_SECONDS)
         try:
             if not config.WATCH_DIGEST_ENABLED or not config.ALERT_EMAIL_ENABLED:
                 continue
@@ -564,6 +598,21 @@ async def _watch_digest_loop():
                     best_score, best_mint, config.WATCH_DIGEST_MIN_SCORE,
                 )
                 continue
+
+            global _last_digest_mint, _last_digest_at
+            now = datetime.now(timezone.utc)
+            if (
+                best_mint == _last_digest_mint
+                and _last_digest_at is not None
+                and (now - _last_digest_at).total_seconds() < config.WATCH_DIGEST_REPEAT_COOLDOWN_MINUTES * 60
+            ):
+                log.info(
+                    "Digest прескочен - същата монета като последния изпратен digest (%s) - "
+                    "изчаквам WATCH_DIGEST_REPEAT_COOLDOWN_MINUTES (%d мин), за да не спамя за нея.",
+                    best_mint, config.WATCH_DIGEST_REPEAT_COOLDOWN_MINUTES,
+                )
+                continue
+
             result = MemeScoreResult(
                 mint=best_mint,
                 score=best_data.get("score", 0),
@@ -572,7 +621,14 @@ async def _watch_digest_loop():
                 market_cap_usd=best_data.get("market_cap_usd", 0) or 0,
                 potential_label=best_data.get("potential_label", ""),
             )
-            send_watch_digest(result)
+            # Само при РЕАЛНО обработен digest (виж send_watch_digest контракта:
+            # True = пратен/изключен, False = пропуснат чисто заради anti-spam
+            # темпото) обновяваме дедупликационното състояние - иначе цикъл,
+            # пропуснат заради темпото, би "заключил" cooldown-а без реално
+            # пратен имейл.
+            if send_watch_digest(result):
+                _last_digest_mint = best_mint
+                _last_digest_at = now
         except Exception as e:
             log.warning("Грешка в периодичния watch-digest loop: %s", e)
 
@@ -671,6 +727,26 @@ async def monitor_token(mint: str):
                     "risk_label": _risk_label(result.reasons, rugcheck_report),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
+
+            # "Ранна монета" - виж config.EARLY_GEM_* за пълния контекст
+            # (24.09, по избор на потребителя). НЕЗАВИСИМО от consecutive_
+            # high_potential/MIN_POLLS_BEFORE_ALERT по-долу - нарочно, целта
+            # тук е скорост (хвани я РАНО), не потвърждение. Пращаме ВЕДНЪЖ
+            # на mint (виж _early_gem_alerted), докато market cap-ът е още
+            # в ранния диапазон.
+            if (
+                config.EARLY_GEM_ENABLED
+                and mint not in _early_gem_alerted
+                and config.EARLY_GEM_MIN_MC <= (result.market_cap_usd or 0) <= config.EARLY_GEM_MAX_MC
+                and result.score >= config.EARLY_GEM_MIN_SCORE
+            ):
+                info = best_pair.get("info") or {}
+                has_social_presence = bool(info.get("socials") or info.get("websites"))
+                if not config.EARLY_GEM_REQUIRE_SOCIAL_PRESENCE or has_social_presence:
+                    creator = (rugcheck_report or {}).get("creator")
+                    creator_history = await asyncio.to_thread(get_creator_history, creator) if creator else {}
+                    if send_early_gem_alert(result, creator_history, has_social_presence):
+                        _early_gem_alerted.add(mint)
 
             if result.is_high_potential:
                 already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
