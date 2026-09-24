@@ -22,14 +22,25 @@ log = logging.getLogger("notifier")
 RESEND_API_URL = "https://api.resend.com/emails"
 
 
-def _recipients() -> list[str]:
-    """config.ALERT_EMAIL_TO вече поддържа НЯКОЛКО адреса, разделени със
-    запетая (23.09, по изричен избор на потребителя: "искам да изпраща на
-    2 отделни имейла нотификации") - тук просто разделяме и почистваме
-    (trim whitespace, махаме празни) - Resend приема списък адреси в "to"
-    и доставя до всеки от тях."""
-    raw = config.ALERT_EMAIL_TO or ""
-    return [addr.strip() for addr in raw.split(",") if addr.strip()]
+def _accounts() -> list[tuple[str, str]]:
+    """Списък от (api_key, to_email) двойки, през които да пратим email.
+
+    ВАЖНО (23.09, намерено в живи Render логове - Resend отказа ПЪРВИЯ реален
+    алърт с HTTP 403): безплатният Resend "sandbox" режим (без верифициран
+    собствен домейн) позволява изпращане САМО до имейла, с който е
+    регистриран акаунтът - никакъв друг адрес, независимо дали е добавен в
+    "to" списъка на един email или пратен през отделна заявка. Затова "2
+    отделни имейла" (по избор на потребителя) реално изисква ДВА отделни
+    Resend акаунта - всеки регистриран с и позволен само до своя собствен
+    адрес - виж config.RESEND_API_KEY_2/ALERT_EMAIL_TO_2. Ако вторият не е
+    конфигуриран, просто се пропуска (не гърми нищо) - основният адрес пак
+    си работи нормално."""
+    accounts = []
+    if config.RESEND_API_KEY and config.ALERT_EMAIL_TO:
+        accounts.append((config.RESEND_API_KEY, config.ALERT_EMAIL_TO))
+    if config.RESEND_API_KEY_2 and config.ALERT_EMAIL_TO_2:
+        accounts.append((config.RESEND_API_KEY_2, config.ALERT_EMAIL_TO_2))
+    return accounts
 
 # --- "Копирай адреса" ---
 # ВАЖНО (18.09): преди тук имаше бутон-линк към отделна MintClip страничка
@@ -229,12 +240,16 @@ def send_watch_digest(result: MemeScoreResult) -> bool:
 
 
 def _send_email(subject: str, body: str, html: str = None) -> bool:
-    """Връща True ако е "приключено" (пратен успешно, или причината да не се
-    прати НЕ е anti-spam темпото - конфигурация/часове/HTTP грешка, retry
-    не би помогнал), False САМО ако е пропуснат чисто заради темпото (виж
-    can_send_now()/send_alert() по-горе)."""
-    recipients = _recipients()
-    if not (config.RESEND_API_KEY and recipients):
+    """Връща True ако е "приключено" (пратен успешно поне през една сметка,
+    или причината да не се прати НЕ е anti-spam темпото - конфигурация/
+    часове/HTTP грешка, retry не би помогнал), False САМО ако е пропуснат
+    чисто заради темпото (виж can_send_now()/send_alert() по-горе).
+
+    Праща ОТДЕЛНА HTTP заявка за ВСЯКА конфигурирана (api_key, адрес) двойка
+    от _accounts() - виж коментара там за защо (Resend sandbox ограничение:
+    всеки акаунт може да праща само до собствения си регистриран адрес)."""
+    accounts = _accounts()
+    if not accounts:
         log.warning("Email алъртите са включени, но RESEND_API_KEY/ALERT_EMAIL_TO не са попълнени.")
         return True
     if not _within_active_hours():
@@ -246,32 +261,37 @@ def _send_email(subject: str, body: str, html: str = None) -> bool:
         return True
     if not _rate_limit_ok():
         return False
-    payload = {
-        "from": config.RESEND_FROM_EMAIL,
-        "to": recipients,
-        "subject": subject,
-        "text": body,
-    }
-    if html:
-        # Resend показва html, ако е налично - text си остава fallback за
-        # клиенти, които не го рендират. Виж format_alert_html() за бутона.
-        payload["html"] = html
-    try:
-        resp = requests.post(
-            RESEND_API_URL,
-            headers={
-                "Authorization": f"Bearer {config.RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=15,
-        )
-        if resp.status_code >= 300:
-            log.error("Resend отказа изпращането (%s): %s", resp.status_code, resp.text)
-            return True  # HTTP грешка, не anti-spam темпо - retry тук не би помогнал по същия начин
+
+    any_success = False
+    for api_key, to_email in accounts:
+        payload = {
+            "from": config.RESEND_FROM_EMAIL,
+            "to": [to_email],
+            "subject": subject,
+            "text": body,
+        }
+        if html:
+            # Resend показва html, ако е налично - text си остава fallback за
+            # клиенти, които не го рендират. Виж format_alert_html() за бутона.
+            payload["html"] = html
+        try:
+            resp = requests.post(
+                RESEND_API_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=15,
+            )
+            if resp.status_code >= 300:
+                log.error("Resend отказа изпращането до %s (%s): %s", to_email, resp.status_code, resp.text)
+                continue  # HTTP грешка за тази сметка - пробваме следващата (ако има)
+            log.info("Email алърт изпратен до %s през Resend", to_email)
+            any_success = True
+        except Exception as e:
+            log.error("Изпращането на email до %s през Resend се провали: %s", to_email, e)
+
+    if any_success:
         _mark_email_sent()
-        log.info("Email алърт изпратен до %s през Resend", ", ".join(recipients))
-        return True
-    except Exception as e:
-        log.error("Изпращането на email през Resend се провали: %s", e)
-        return True  # мрежова грешка, не anti-spam темпо - вече е логнато, не искаме безкраен retry цикъл
+    return True  # HTTP/конфигурационна грешка за отделна сметка не е anti-spam темпо - retry тук не би помогнал
